@@ -1,39 +1,63 @@
-import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import User from "../models/user.js";
+import ApiError from "../utils/ApiError.js";
+import { verifyAccessToken } from "../utils/tokens.js";
 
-export const AuthMiddleware  =async(req, res, next) => {
- const token1 = req.header("Authorization")?.replace("Bearer ", "").trim();
-  if (!token1) {
-    return res.status(401).json({ message: "Unauthorized: No token provided" });
-  }
+const readBearerToken = (req) => {
+  const header = req.get("authorization") || "";
+  const [scheme, token] = header.split(" ");
+  return scheme?.toLowerCase() === "bearer" && token ? token.trim() : null;
+};
+
+/**
+ * Resolves the user behind an access token. Shared by the HTTP middleware and
+ * the Socket.IO handshake so both enforce exactly the same rules.
+ */
+export const resolveUserFromAccessToken = async (token) => {
+  let payload;
   try {
-    const decoded = jwt.verify(token1, process.env.SECRET);
-    req.user = await User.findById(decoded._id);
-    if (!req.user) {
-      return res.status(403).json({ message: "Invalid token: No user found" });
+    payload = verifyAccessToken(token);
+  } catch (error) {
+    if (error.name === "TokenExpiredError") {
+      throw ApiError.unauthorized("Your session has expired", "TOKEN_EXPIRED");
     }
-    if (req.user.blocked) {
-      return res.status(403).json({ message: "Your account is blocked. Contact the admin." });
-    }
-    next();
-  } 
-  catch (error) {
-    return res.status(403).json({ message: "Invalid or expired token" });
+    throw ApiError.unauthorized("Invalid access token", "INVALID_TOKEN");
   }
+
+  const user = await User.findById(payload.sub).select("+tokenVersion");
+  if (!user) throw ApiError.unauthorized("This account no longer exists", "INVALID_TOKEN");
+  // tokenVersion is bumped on "sign out everywhere" and password changes.
+  if ((user.tokenVersion ?? 0) !== payload.tv) {
+    throw ApiError.unauthorized("This session has been signed out", "TOKEN_REVOKED");
+  }
+  if (user.isBlocked) {
+    throw ApiError.forbidden("Your account has been blocked. Please contact an administrator.", "ACCOUNT_BLOCKED");
+  }
+  return { user, payload };
 };
 
-export default AuthMiddleware;
+/** Requires a valid `Authorization: Bearer <access token>` header. */
+export const authenticate = async (req, _res, next) => {
+  const token = readBearerToken(req);
+  if (!token) throw ApiError.unauthorized("Please sign in to continue", "NO_TOKEN");
+  const { user, payload } = await resolveUserFromAccessToken(token);
+  req.user = user;
+  req.auth = payload;
+  next();
+};
 
-export const isSuperAdmin = (req, res, next) => {
-  if (!req.user || req.user.role !== 'superadmin') {
-    return res.status(403).json({ message: 'Access denied. Only Super Admin can perform this action.' });
+/** Attaches the user when a valid token is sent, but never rejects the request. */
+export const optionalAuth = async (req, _res, next) => {
+  const token = readBearerToken(req);
+  if (token) {
+    try {
+      const { user, payload } = await resolveUserFromAccessToken(token);
+      req.user = user;
+      req.auth = payload;
+    } catch {
+      // treat as anonymous
+    }
   }
   next();
 };
-export const isAdmin = (req, res, next) => {
-  if (!req.user || (req.user.role !== 'admin' && req.user.role !== 'superadmin')) {
-    return res.status(403).json({ message: 'Access denied. Admins only.' });
-  }
-  next();
-};
-  
+
+export default authenticate;
