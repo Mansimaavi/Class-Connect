@@ -1,0 +1,14 @@
+node_modules
+npm-debug.log*
+coverage
+tests
+vitest.config.js
+eslint.config.js
+.env
+.env.*
+!.env.example
+Dockerfile
+.dockerignore
+.git
+.gitignore
+*.md
