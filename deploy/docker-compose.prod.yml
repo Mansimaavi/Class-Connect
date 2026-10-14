@@ -1,0 +1,66 @@
+# Production stack on the EC2 host. Images come from Amazon ECR; secrets come
+# from SSM Parameter Store (written to app.env by remote-deploy.sh).
+#
+#   internet -> caddy (:443, automatic HTTPS) -> web (nginx: React build + proxy) -> api (Node)
+#                                                                                   -> MongoDB Atlas
+
+# Container logs go to CloudWatch Logs (log group created by the CloudFormation stack).
+x-logging: &cloudwatch
+  driver: awslogs
+
+services:
+  api:
+    image: ${API_IMAGE}:${IMAGE_TAG}
+    restart: unless-stopped
+    env_file: app.env
+    environment:
+      NODE_ENV: production
+      PORT: "5000"
+      # caddy + nginx sit in front of the API
+      TRUST_PROXY: "2"
+    logging:
+      <<: *cloudwatch
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /classconnect/prod
+        awslogs-stream: api
+
+  web:
+    image: ${WEB_IMAGE}:${IMAGE_TAG}
+    restart: unless-stopped
+    environment:
+      API_UPSTREAM: http://api:5000
+    depends_on:
+      api:
+        condition: service_healthy
+    logging:
+      <<: *cloudwatch
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /classconnect/prod
+        awslogs-stream: web
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - web
+    logging:
+      <<: *cloudwatch
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /classconnect/prod
+        awslogs-stream: caddy
+
+volumes:
+  caddy-data:
+  caddy-config:

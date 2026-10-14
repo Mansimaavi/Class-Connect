@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /Backend
+    schedule:
+      interval: monthly
+    groups:
+      backend-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /Frontend
+    schedule:
+      interval: monthly
+    groups:
+      frontend-minor:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+
+  - package-ecosystem: docker
+    directories: [/Backend, /Frontend]
+    schedule:
+      interval: monthly

@@ -1,0 +1,157 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # cancel superseded PR runs, but never interrupt a deployment
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  backend:
+    name: Backend · lint & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Backend
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Backend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - name: Unit + integration tests (with coverage)
+        run: npm run test:coverage
+        env:
+          MONGO_URI_TEST: mongodb://localhost:27017
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: Backend/coverage
+          if-no-files-found: ignore
+
+  frontend:
+    name: Frontend · lint, test & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: Frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  docker:
+    name: Docker · build images
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api, web]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.service == 'api' && 'Backend' || 'Frontend' }}
+          push: false
+          tags: classconnect-${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy:
+    name: Deploy · AWS (ECR + EC2)
+    needs: [docker]
+    # Runs once the AWS stack exists and the repository variable AWS_DEPLOY_ENABLED is "true".
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.AWS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.APP_DOMAIN }}
+    permissions:
+      contents: read
+      id-token: write # lets GitHub's OIDC token assume the AWS role; no long-lived AWS keys
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: Backend
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/classconnect-api:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/classconnect-api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build and push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: Frontend
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/classconnect-web:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/classconnect-web:latest
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+
+      - name: Roll out on EC2 via SSM
+        run: bash .github/scripts/ssm-deploy.sh
+        env:
+          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          API_IMAGE: ${{ steps.ecr.outputs.registry }}/classconnect-api
+          WEB_IMAGE: ${{ steps.ecr.outputs.registry }}/classconnect-web
+          IMAGE_TAG: ${{ github.sha }}
+          DOMAIN: ${{ vars.APP_DOMAIN }}
+          PARAM_PATH: /classconnect/prod
+
+      - name: Smoke test the live site
+        run: |
+          curl -fsS --retry 12 --retry-delay 10 --retry-all-errors "https://${{ vars.APP_DOMAIN }}/api/health/ready"
+          curl -fsS -o /dev/null "https://${{ vars.APP_DOMAIN }}/"
+          echo "https://${{ vars.APP_DOMAIN }} is live" >> "$GITHUB_STEP_SUMMARY"
