@@ -12,7 +12,7 @@ ENV VITE_API_URL=${VITE_API_URL}
 RUN npm run build
 
 # ---- serve with nginx ----
-FROM nginx:1.27-alpine
+FROM nginx:1.31-alpine
 # The official image runs envsubst over /etc/nginx/templates/*.template on start.
 ENV API_UPSTREAM=http://api:5000
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
