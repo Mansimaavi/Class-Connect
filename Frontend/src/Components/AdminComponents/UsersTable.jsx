@@ -1,30 +1,23 @@
-import React, { useState } from "react";
-import { Table, Button, Badge, Alert, Pagination } from "react-bootstrap";
+import { Alert, Badge, Button, Pagination, Table } from "react-bootstrap";
 
-const UsersTable = ({ users, handlePromote, handleDemote, handleDelete, handleViewProfile, handleBlockUnblock }) => {
-  const [currentPage, setCurrentPage] = useState(1); // State for current page
-  const usersPerPage = 10; // Number of users to display per page
+const RANK = { user: 0, admin: 1, superadmin: 2 };
+const ROLE_BADGE = { superadmin: "danger", admin: "success", user: "primary" };
 
-  // Calculate the total number of pages
-  const totalPages = Math.ceil(users.length / usersPerPage);
-
-  // Get the users for the current page
-  const indexOfLastUser = currentPage * usersPerPage;
-  const indexOfFirstUser = indexOfLastUser - usersPerPage;
-  const currentUsers = users.slice(indexOfFirstUser, indexOfLastUser);
-  
-  // Handle page change
-  const handlePageChange = (pageNumber) => {
-    setCurrentPage(pageNumber);
-  };
-
-  if (!users || users.length === 0) {
+/**
+ * Server-paginated user table. Action buttons only appear for users the
+ * current admin outranks; the API enforces the same rule.
+ */
+const UsersTable = ({ users, pagination, currentUser, onPageChange, onViewProfile, onChangeRole, onToggleBlock, onDelete }) => {
+  if (!users.length) {
     return (
       <Alert variant="info" className="text-center">
         No users found.
       </Alert>
     );
   }
+
+  const outranks = (target) => RANK[currentUser.role] > RANK[target.role] && target._id !== currentUser._id;
+  const isSuperAdmin = currentUser.role === "superadmin";
 
   return (
     <>
@@ -36,76 +29,50 @@ const UsersTable = ({ users, handlePromote, handleDemote, handleDelete, handleVi
             <th>Role</th>
             <th>Uploads</th>
             <th>Downloads</th>
-            <th>Last Active</th>
+            <th>Last active</th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          {currentUsers.map((user) => (
-            <tr key={user._id} className={user.role === "superadmin" ? "bg-warning" : ""}>
+          {users.map((user) => (
+            <tr key={user._id} className={user.isBlocked ? "table-secondary" : ""}>
               <td>
-                <span
-                  className="text-primary"
-                  style={{ cursor: "pointer" }}
-                  onClick={() => handleViewProfile(user._id)}
-                >
+                <button type="button" className="btn btn-link p-0" onClick={() => onViewProfile(user._id)}>
                   {user.name}
-                </span>
+                </button>
+                <div className="small text-muted">@{user.username}</div>
               </td>
               <td>{user.email}</td>
               <td>
-                <Badge
-                  bg={
-                    user.role === "superadmin"
-                      ? "danger"
-                      : user.role === "admin"
-                      ? "success"
-                      : "primary"
-                  }
-                >
-                  {user.role}
-                </Badge>
+                <Badge bg={ROLE_BADGE[user.role]}>{user.role}</Badge>{" "}
+                {user.isBlocked && <Badge bg="dark">blocked</Badge>}{" "}
+                {user.twoFactor?.enabled && <Badge bg="info">2FA</Badge>}
               </td>
-              <td>{user.uploadsCount || 0}</td>
-              <td>{user.downloadsCount || 0}</td>
+              <td>{user.uploadsCount}</td>
+              <td>{user.downloadsCount}</td>
               <td>{user.lastLogin ? new Date(user.lastLogin).toLocaleString() : "Never"}</td>
-              <td>
-                {user.role !== "superadmin" && (
+              <td className="text-nowrap">
+                {outranks(user) ? (
                   <>
-                    {user.role !== "admin" && (
+                    {isSuperAdmin && (
                       <Button
-                        variant="warning"
+                        variant={user.role === "admin" ? "secondary" : "warning"}
                         size="sm"
                         className="me-2"
-                        onClick={() => handlePromote(user._id)}
+                        onClick={() => onChangeRole(user, user.role === "admin" ? "user" : "admin")}
                       >
-                        Promote to Admin
+                        {user.role === "admin" ? "Demote" : "Make admin"}
                       </Button>
                     )}
-                    {user.role === "admin" && (
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        className="me-2"
-                        onClick={() => handleDemote(user._id)}
-                      >
-                        Demote to User
-                      </Button>
-                    )}
-                    <Button
-                      variant="danger"
-                      size="sm"
-                      onClick={() => handleDelete(user._id)}
-                    >
+                    <Button variant={user.isBlocked ? "success" : "outline-danger"} size="sm" className="me-2" onClick={() => onToggleBlock(user)}>
+                      {user.isBlocked ? "Unblock" : "Block"}
+                    </Button>
+                    <Button variant="danger" size="sm" onClick={() => onDelete(user)}>
                       Delete
                     </Button>
-                    <Button
-  variant={user.isBlocked ? "success" : "danger"} // Green for unblock, red for block
-  size="sm"
-  onClick={() => handleBlockUnblock(user._id, user.isBlocked)}
->
-  {user.isBlocked ? "Unblock" : "Block"}
-</Button>
                   </>
+                ) : (
+                  <span className="small text-muted">—</span>
                 )}
               </td>
             </tr>
@@ -113,28 +80,19 @@ const UsersTable = ({ users, handlePromote, handleDemote, handleDelete, handleVi
         </tbody>
       </Table>
 
-      {/* Pagination */}
-      <div className="d-flex justify-content-center">
-        <Pagination>
-          <Pagination.Prev
-            onClick={() => handlePageChange(currentPage - 1)}
-            disabled={currentPage === 1}
-          />
-          {Array.from({ length: totalPages }, (_, index) => (
-            <Pagination.Item
-              key={index + 1}
-              active={index + 1 === currentPage}
-              onClick={() => handlePageChange(index + 1)}
-            >
-              {index + 1}
-            </Pagination.Item>
-          ))}
-          <Pagination.Next
-            onClick={() => handlePageChange(currentPage + 1)}
-            disabled={currentPage === totalPages}
-          />
-        </Pagination>
-      </div>
+      {pagination.pages > 1 && (
+        <div className="d-flex justify-content-center">
+          <Pagination>
+            <Pagination.Prev onClick={() => onPageChange(pagination.page - 1)} disabled={pagination.page === 1} />
+            {Array.from({ length: pagination.pages }, (_, index) => (
+              <Pagination.Item key={index + 1} active={index + 1 === pagination.page} onClick={() => onPageChange(index + 1)}>
+                {index + 1}
+              </Pagination.Item>
+            ))}
+            <Pagination.Next onClick={() => onPageChange(pagination.page + 1)} disabled={pagination.page === pagination.pages} />
+          </Pagination>
+        </div>
+      )}
     </>
   );
 };

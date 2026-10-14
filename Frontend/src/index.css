@@ -1,9 +1,10 @@
-
-/* index.css */
-@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@700;800&display=swap');
-
 @import "tailwindcss";
+
 body {
-  font-family: 'Roboto', sans-serif,'Popins';
+  font-family: "Roboto", "Poppins", sans-serif;
+}
+
+/* Bootstrap underlines every link; Tailwind utilities decide per element instead. */
+a.no-underline {
+  text-decoration: none;
 }

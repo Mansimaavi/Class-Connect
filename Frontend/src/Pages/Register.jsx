@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from "react";
-import { useNavigate, Link } from "react-router-dom";
-import sittingchild from '../assets/sittting.png';
-import block from '../assets/block.png';
-import { FaUser, FaUserCircle, FaEnvelope, FaLock, FaBookOpen, FaUniversity } from "react-icons/fa";
+import { useEffect, useState } from "react";
+import { FaBookOpen, FaEnvelope, FaLock, FaUniversity, FaUser, FaUserCircle } from "react-icons/fa";
+import { Link, Navigate, useNavigate } from "react-router-dom";
+import block from "../assets/block.webp";
+import sittingchild from "../assets/sittting.webp";
+import { useAuth } from "../Components/AuthComponents/AuthContext";
+import api, { getErrorMessage, getFieldErrors } from "../lib/api";
 
 const Register = () => {
   const [formData, setFormData] = useState({
@@ -17,27 +19,26 @@ const Register = () => {
   });
 
   const [errors, setErrors] = useState({});
+  const [formError, setFormError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const navigate = useNavigate();
+  const { isLoggedIn } = useAuth();
 
+  // Location is optional: it only powers the admin's sign-up map.
   useEffect(() => {
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setFormData((prevData) => ({
-            ...prevData,
-            latitude: position.coords.latitude,
-            longitude: position.coords.longitude,
-          }));
-        },
-        (error) => {
-          console.error("Error getting location:", error);
-          alert("Location access denied. Please enable location to continue.");
-        }
-      );
-    } else {
-      alert("Geolocation is not supported by your browser.");
-    }
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (position) =>
+        setFormData((prevData) => ({
+          ...prevData,
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        })),
+      () => {}
+    );
   }, []);
+
+  if (isLoggedIn) return <Navigate to="/dashboard" replace />;
 
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -49,39 +50,29 @@ const Register = () => {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    let validationErrors = {};
-    if (!formData.name) validationErrors.name = "Name is required.";
-    if (!formData.username) validationErrors.username = "Username is required.";
-    if (!formData.email.includes("@")) validationErrors.email = "Please enter a valid email.";
-    if (formData.password.length < 8) validationErrors.password = "Password must be at least 8 characters long.";
-    if (!formData.course) validationErrors.course = "Course/Degree is required.";
-    if (!formData.college) validationErrors.college = "College name is required.";
+    setFormError("");
+    const validationErrors = {};
+    if (!formData.name.trim()) validationErrors.name = "Name is required.";
+    if (!/^[a-zA-Z0-9_.]{3,30}$/.test(formData.username.trim()))
+      validationErrors.username = "Username must be 3-30 letters, numbers, dots or underscores.";
+    if (!/^\S+@\S+\.\S+$/.test(formData.email.trim())) validationErrors.email = "Please enter a valid email.";
+    if (formData.password.length < 8 || !/[A-Za-z]/.test(formData.password) || !/\d/.test(formData.password))
+      validationErrors.password = "Use at least 8 characters with a letter and a number.";
+    if (!formData.course.trim()) validationErrors.course = "Course/Degree is required.";
+    if (!formData.college.trim()) validationErrors.college = "College name is required.";
 
-    if (Object.keys(validationErrors).length > 0) {
-      setErrors(validationErrors);
-      return;
-    }
+    setErrors(validationErrors);
+    if (Object.keys(validationErrors).length > 0) return;
 
+    setSubmitting(true);
     try {
-      console.log("hey");
-      const otpResponse = await fetch("http://localhost:5000/api/auth/sendotp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: formData.email }),
-      });
-
-      const otpData = await otpResponse.json();
-      if (!otpResponse.ok) {
-        alert(`Error sending OTP: ${otpData.message}`);
-        return;
-      }
-
-      alert("OTP sent to your email. Please verify.");
+      await api.post("/auth/send-otp", { email: formData.email.trim() });
       navigate("/register-verification", { state: { formData } });
-
     } catch (error) {
-      console.error("OTP sending failed:", error);
-      alert("Something went wrong. Please try again.");
+      setErrors(getFieldErrors(error));
+      setFormError(getErrorMessage(error));
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -89,10 +80,11 @@ const Register = () => {
     <div className="relative flex min-h-screen bg-[#faf6f6] items-center justify-center px-4 overflow-hidden">
       {/* Right Form Section */}
       <div className="w-full md:w-1/3 p-8 bg-[#f8f8f8]">
-        <h1 className="text-2xl font-extrabold font-Cal Sans mb-1">Let's<br />Start Learning</h1>
-        <p className="text-gray-600 mb-6">Please login or sign up to continue</p>
+        <h1 className="text-2xl font-extrabold  mb-1">Let's<br />Start Learning</h1>
+        <p className="text-gray-600 mb-6">Create your account. We'll email you a code to verify it.</p>
 
-        <form onSubmit={handleSubmit}>
+        {formError && <p className="mb-3 rounded bg-red-50 px-3 py-2 text-sm text-red-700">{formError}</p>}
+        <form onSubmit={handleSubmit} noValidate>
         <div className="mb-2 relative">
     <FaUser className="absolute  top-1/2 left-3 transform -translate-y-1/2 text-gray-400" />
     <input
@@ -173,9 +165,10 @@ const Register = () => {
 
   <button
     type="submit"
-    className="w-full h-14 bg-orange-500 hover:bg-orange-600 text-white font-semibold py-2 rounded transition duration-200"
+    disabled={submitting}
+    className="w-full h-14 bg-orange-500 hover:bg-orange-600 text-white font-semibold py-2 rounded transition duration-200 disabled:opacity-60"
   >
-    Sign Up
+    {submitting ? "Sending code…" : "Sign Up"}
   </button>
 
   <div className="my-4 flex items-center">
@@ -201,7 +194,7 @@ const Register = () => {
         />
         <img
         src={block}
-        alt="Child Sitting"
+        alt=""
         className="hidden sm:block absolute  bottom-1/12 right-70 w-52 md:w-50 lg:w-75 opacity-90"
         />
     </div>

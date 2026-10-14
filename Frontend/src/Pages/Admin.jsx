@@ -1,358 +1,174 @@
-import React, { useEffect, useState } from "react";
-import { useAuth } from "../Components/AuthComponents/AuthContext.jsx";
+import { useCallback, useEffect, useState } from "react";
+import { Alert, Col, Container, Form, Row, Spinner } from "react-bootstrap";
 import { useNavigate } from "react-router-dom";
-import { Container, Spinner, Alert, Row, Col } from "react-bootstrap";
-import axios from "axios";
-import { io } from "socket.io-client";
-import SearchBar from "../Components/search"; // Import the SearchBar component
-import Notifications from "../Components/Notification";
-import StatisticsCards from "../Components/AdminComponents/StatisticsCards.jsx";
-import UsersTable from "../Components/AdminComponents/UsersTable.jsx";
-import Role from "../Components/AdminComponents/roles.jsx";
-import { Form } from "react-bootstrap";
-import UserActivityGraph from "../Components/AdminComponents/UserActivity.jsx";
-import Navbar  from "../Components/Navbar";
+import ActivityFeed from "../Components/AdminComponents/ActivityFeed.jsx";
 import Location from "../Components/AdminComponents/Location.jsx";
-import MultiLevelDropdown from "../Components/AdminComponents/MultiLevelDropdown.jsx";
-import {
-  Chart as ChartJS,
-  CategoryScale,
-  LinearScale,
-  BarElement,
-  Title,
-  Tooltip,
-  Legend,
-} from "chart.js";
-
-ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
-
-const socket = io("http://localhost:5000");
+import RoleCharts from "../Components/AdminComponents/RoleCharts.jsx";
+import StatisticsCards from "../Components/AdminComponents/StatisticsCards.jsx";
+import UserActivityChart from "../Components/AdminComponents/UserActivityChart.jsx";
+import UserSearchBar from "../Components/AdminComponents/UserSearchBar.jsx";
+import UsersTable from "../Components/AdminComponents/UsersTable.jsx";
+import { useAuth } from "../Components/AuthComponents/AuthContext.jsx";
+import Navbar from "../Components/Navbar";
+import { useSocketEvent } from "../hooks/useSocket";
+import api, { getErrorMessage } from "../lib/api";
 
 const AdminDashboard = () => {
-  const { isLoggedIn } = useAuth();
+  const { user: currentUser } = useAuth();
+  const navigate = useNavigate();
+
   const [users, setUsers] = useState([]);
+  const [pagination, setPagination] = useState({ page: 1, pages: 1, total: 0 });
+  const [filters, setFilters] = useState({ search: "", role: "", status: "", sort: "lastLogin", page: 1 });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notifications, setNotifications] = useState([]);
-  const [stats, setStats] = useState({
-    activeUsersCount: 0,
-    totalUploads: 0,
-    totalDownloads: 0,
-    mostActiveUsers: [],
-  });
-  const [filterType, setFilterType] = useState("none"); // Default: No filter
-  const [roleFilter, setRoleFilter] = useState("");
-  const [searchResults, setSearchResults] = useState([]); // State for search results
-  const [isSearchActive, setIsSearchActive] = useState(false); // Track if search is active
-  const [userId, setUserId] = useState(""); 
-  const navigate = useNavigate();
 
-  useEffect(() => {
-    if (!isLoggedIn) {
-      navigate("/");
-    } else {
-      fetchStats();
-      fetchUsers();
-    }
-  }, [isLoggedIn, navigate]);
-
-  // Fetch notifications, stats, and users
-  useEffect(() => {
-    const fetchNotifications = async () => {
-      try {
-        const { data } = await axios.get("http://localhost:5000/api/notifications");
-        setNotifications(data);
-      } catch (error) {
-        console.error("Error fetching notifications:", error);
-      }
-    };
-
-    fetchNotifications();
-  }, []);
-
-  // Socket.IO event listeners
-  useEffect(() => {
-    socket.on("user-registered", (data) => {
-      setNotifications((prev) => [...prev, { type: "user", message: data.message }]);
-    });
-
-    socket.on("file-uploaded", (data) => {
-      setNotifications((prev) => [...prev, { type: "upload", message: data.message }]);
-    });
-
-    socket.on("file-downloaded", (data) => {
-      setNotifications((prev) => [...prev, { type: "download", message: data.message }]);
-    });
-
-    return () => {
-      socket.off("user-registered");
-      socket.off("file-uploaded");
-      socket.off("file-downloaded");
-    };
-  }, []);
-
-  const fetchStats = async () => {
+  const fetchUsers = useCallback(async () => {
     try {
-      const response = await fetch("http://localhost:5000/api/stat/stats", {
-        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch stats");
-      }
-      const data = await response.json();
-      setStats(data);
-    } catch (error) {
-      setError("Error fetching stats.");
-    }
-  };
-
-  const fetchUsers = async () => {
-    try {
-      let url = `http://localhost:5000/api/admin/users?filterType=${filterType}`;
-
-      // Add role filter if filterType is "role"
-      if (filterType === "role" && roleFilter) {
-        url += `&role=${roleFilter}`;
-      }
-
-      const response = await fetch(url, {
-        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch users");
-      }
-
-      const data = await response.json();
-      setUsers(data);
-      setLoading(false);
-    } catch (error) {
-      setError("Error fetching users.");
+      const params = Object.fromEntries(Object.entries(filters).filter(([, value]) => value !== ""));
+      const { data } = await api.get("/admin/users", { params: { ...params, limit: 10 } });
+      setUsers(data.users);
+      setPagination(data.pagination);
+      setError("");
+    } catch (err) {
+      setError(getErrorMessage(err, "Couldn't load users."));
+    } finally {
       setLoading(false);
     }
-  };
+  }, [filters]);
 
   useEffect(() => {
     fetchUsers();
-  }, [roleFilter, filterType]);
+  }, [fetchUsers]);
 
-  const handlePromote = async (userId) => {
+  useEffect(() => {
+    api
+      .get("/admin/notifications")
+      .then(({ data }) => setNotifications(data.notifications))
+      .catch(() => {});
+  }, []);
+
+  useSocketEvent("admin:activity", (entry) => setNotifications((current) => [...current, entry].slice(-50)));
+
+  const updateFilters = (changes) => setFilters((current) => ({ ...current, ...changes, page: changes.page ?? 1 }));
+
+  const replaceUser = (updated) => setUsers((current) => current.map((u) => (u._id === updated._id ? { ...u, ...updated } : u)));
+
+  const changeRole = async (user, role) => {
+    const verb = role === "admin" ? "make an admin" : "demote to a regular user";
+    if (!window.confirm(`Are you sure you want to ${verb}: ${user.name}?`)) return;
     try {
-      const response = await fetch(`http://localhost:5000/api/admin/promote`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${localStorage.getItem("token")}`,
-        },
-        body: JSON.stringify({ userId }),
-      });
-  
-      const data = await response.json();
-      if (response.ok) {
-        // Update the users state
-        setUsers((prevUsers) =>
-          prevUsers.map((user) =>
-            user._id === userId ? { ...user, role: "admin" } : user
-          )
-        );
-  
-        // Update the searchResults state
-        setSearchResults((prevResults) =>
-          prevResults.map((user) =>
-            user._id === userId ? { ...user, role: "admin" } : user
-          )
-        );
-      } else {
-        setError(data.message || "Failed to promote user.");
-      }
-    } catch (error) {
-      setError("Error promoting user. Please try again.");
+      const { data } = await api.patch(`/admin/users/${user._id}/role`, { role });
+      replaceUser(data.user);
+    } catch (err) {
+      setError(getErrorMessage(err));
     }
   };
-  const handleBlockUnblock = async (userId, isBlocked) => {
+
+  const toggleBlock = async (user) => {
+    const blocked = !user.isBlocked;
+    if (blocked && !window.confirm(`Block ${user.name}? They'll be signed out immediately.`)) return;
     try {
-      const response = await fetch(`http://localhost:5000/api/admin/${isBlocked ? "unblock" : "block"}`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${localStorage.getItem("token")}`,
-        },
-        body: JSON.stringify({ userId }),
-      });
-  
-      const data = await response.json();
-      if (response.ok) {
-        // Update the users state
-        setUsers((prevUsers) =>
-          prevUsers.map((user) =>
-            user._id === userId ? { ...user, isBlocked: !isBlocked } : user
-          )
-        );
-  
-        // Update the searchResults state
-        setSearchResults((prevResults) =>
-          prevResults.map((user) =>
-            user._id === userId ? { ...user, isBlocked: !isBlocked } : user
-          )
-        );
-      } else {
-        setError(data.message || `Failed to ${isBlocked ? "unblock" : "block"} user.`);
-      }
-    } catch (error) {
-      setError(`Error ${isBlocked ? "unblocking" : "blocking"} user. Please try again.`);
+      const { data } = await api.patch(`/admin/users/${user._id}/status`, { blocked });
+      replaceUser(data.user);
+    } catch (err) {
+      setError(getErrorMessage(err));
     }
   };
-  
-  const handleDemote = async (userId) => {
+
+  const deleteUser = async (user) => {
+    if (!window.confirm(`Delete ${user.name}? Classrooms they own will be deleted too. This can't be undone.`)) return;
     try {
-      const response = await fetch(`http://localhost:5000/api/admin/demote`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${localStorage.getItem("token")}`,
-        },
-        body: JSON.stringify({ userId }),
-      });
-  
-      const data = await response.json();
-      if (response.ok) {
-        // Update the users state
-        setUsers((prevUsers) =>
-          prevUsers.map((user) =>
-            user._id === userId ? { ...user, role: "user" } : user
-          )
-        );
-  
-        // Update the searchResults state
-        setSearchResults((prevResults) =>
-          prevResults.map((user) =>
-            user._id === userId ? { ...user, role: "user" } : user
-          )
-        );
-      } else {
-        setError(data.message || "Failed to demote user.");
-      }
-    } catch (error) {
-      setError("Error demoting user. Please try again.");
+      await api.delete(`/admin/users/${user._id}`);
+      fetchUsers();
+    } catch (err) {
+      setError(getErrorMessage(err));
     }
-  };
-
-  const handleDelete = async (userId) => {
-    if (window.confirm("Are you sure you want to delete this user? This action cannot be undone.")) {
-      try {
-        const response = await fetch(`http://localhost:5000/api/admin/user/${userId}`, {
-          method: "DELETE",
-          headers: {
-            Authorization: `Bearer ${localStorage.getItem("token")}`,
-          },
-        });
-  
-        if (response.ok) {
-          // Update the users state
-          setUsers((prevUsers) => prevUsers.filter((user) => user._id !== userId));
-  
-          // Update the searchResults state
-          setSearchResults((prevResults) => prevResults.filter((user) => user._id !== userId));
-        } else {
-          setError("Failed to delete user.");
-        }
-      } catch (error) {
-        setError("Error deleting user. Please try again.");
-      }
-    }
-  };
-  
-  const resetSearch = () => {
-    setSearchResults([]); // Clear search results
-  };
-
-  const handleSearch = async (query) => {
-    try {
-      const response = await fetch(`http://localhost:5000/api/stat/search?query=${query}`, {
-        headers: { Authorization: `Bearer ${localStorage.getItem("token")}` },
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed to fetch search results");
-      }
-
-      const data = await response.json();
-      setSearchResults(data); // Update search results
-      setIsSearchActive(true); // Set search as active
-    } catch (error) {
-      console.error("Error searching users:", error);
-    }
-  };
-  const handleViewProfile = (userId) => {
-    navigate(`/profile/${userId}`);
   };
 
   return (
     <>
-    <Navbar/>
-    <Container className="mt-5">
-      <h2 className="text-center mb-4">Admin Dashboard</h2>
-      {error && <Alert variant="danger">{error}</Alert>}
-      {loading ? (
-        <div className="d-flex justify-content-center">
-          <Spinner animation="border" role="status">
-            <span className="visually-hidden">Loading...</span>
-          </Spinner>
-        </div>
-      ) : (
-        <>
-          <Row className="mb-4">
-  <Col md={12}>
-    <UserActivityGraph />
-  </Col>
-</Row>
-<Row className="mb-4">
-  <Col md={12}>
-    <Location />
-  </Col>
-</Row>
+      <Navbar />
+      <Container className="mt-5 mb-5">
+        <h2 className="mb-4 text-center">Admin dashboard</h2>
+        {error && (
+          <Alert variant="danger" dismissible onClose={() => setError("")}>
+            {error}
+          </Alert>
+        )}
 
+        <Row className="mb-4">
+          <Col md={3}>
+            <ActivityFeed notifications={notifications} />
+          </Col>
+          <Col md={9}>
+            <StatisticsCards />
+            <RoleCharts />
+          </Col>
+        </Row>
 
-          <Row>
-            <Col md={3}>
-              <Notifications notifications={notifications} />
-            </Col>
-            <Col md={9}>
-              <StatisticsCards stats={stats} />
-              <Role />
-              <Row className="mb-3">
-                <Col md={6}>
-                  <MultiLevelDropdown
-                    setFilterType={setFilterType}
-                    setRoleFilter={setRoleFilter}
-                  />
-                </Col>
-              </Row>
-              <Row>
-        
-      </Row>
-              <Row className="mb-4">
-                <Col md={8}>
-                <SearchBar onSearch={handleSearch} resetSearch={resetSearch} />
-                </Col>
-              </Row>
-     
-              {/* Pass searchResults to UsersTable */}
-              <UsersTable
-              users={isSearchActive ? searchResults : users} 
-                handlePromote={handlePromote}
-                handleDemote={handleDemote}
-                handleDelete={handleDelete}
-                handleViewProfile={handleViewProfile}
-                handleBlockUnblock={handleBlockUnblock}
+        <h4 className="mb-3">Users</h4>
+        <Row className="mb-3 g-2">
+          <Col md={5}>
+            <UserSearchBar onSearch={(search) => updateFilters({ search })} resetSearch={() => updateFilters({ search: "" })} />
+          </Col>
+          <Col md={2}>
+            <Form.Select value={filters.role} onChange={(e) => updateFilters({ role: e.target.value })} aria-label="Filter by role">
+              <option value="">All roles</option>
+              <option value="user">Users</option>
+              <option value="admin">Admins</option>
+              <option value="superadmin">Super admins</option>
+            </Form.Select>
+          </Col>
+          <Col md={2}>
+            <Form.Select value={filters.status} onChange={(e) => updateFilters({ status: e.target.value })} aria-label="Filter by status">
+              <option value="">Any status</option>
+              <option value="active">Active</option>
+              <option value="blocked">Blocked</option>
+            </Form.Select>
+          </Col>
+          <Col md={3}>
+            <Form.Select value={filters.sort} onChange={(e) => updateFilters({ sort: e.target.value })} aria-label="Sort users">
+              <option value="lastLogin">Sort: last active</option>
+              <option value="createdAt">Sort: newest</option>
+              <option value="name">Sort: name</option>
+            </Form.Select>
+          </Col>
+        </Row>
 
-              />
-            </Col>
-          </Row>
-        </>
-      )}
-    </Container>
+        {loading ? (
+          <div className="d-flex justify-content-center">
+            <Spinner animation="border" role="status">
+              <span className="visually-hidden">Loading…</span>
+            </Spinner>
+          </div>
+        ) : (
+          <UsersTable
+            users={users}
+            pagination={pagination}
+            currentUser={currentUser}
+            onPageChange={(page) => updateFilters({ page })}
+            onViewProfile={(userId) => navigate(`/profile/${userId}`)}
+            onChangeRole={changeRole}
+            onToggleBlock={toggleBlock}
+            onDelete={deleteUser}
+          />
+        )}
+
+        <Row className="mb-4 mt-5">
+          <Col md={12}>
+            <h4 className="mb-3">Daily activity</h4>
+            <UserActivityChart />
+          </Col>
+        </Row>
+        <Row className="mb-4">
+          <Col md={12}>
+            <h4 className="mb-3">Where users signed up</h4>
+            <Location />
+          </Col>
+        </Row>
+      </Container>
     </>
   );
 };

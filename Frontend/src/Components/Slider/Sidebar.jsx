@@ -1,63 +1,37 @@
-import React from 'react';
-import profile from '../../assets/user.png'
-import activity from '../../assets/mobile.png';
-import setting from '../../assets/account-settings.png';
-const loggedInUser = JSON.parse(localStorage.getItem("user"));
-const loggedInUserId = loggedInUser?._id;
+import setting from "../../assets/account-settings.webp";
+import activity from "../../assets/mobile.webp";
+import profile from "../../assets/user.webp";
 
-const Sidebar = ({ activeSection, setActiveSection, sectionRefs, profileUserId }) => {
+const SECTIONS = [
+  { id: "profile", label: "Profile", icon: profile },
+  { id: "security", label: "Security", icon: setting, ownOnly: true },
+  { id: "activity", label: "Activity", icon: activity },
+];
+
+const Sidebar = ({ activeSection, setActiveSection, sectionRefs, showSecurity }) => {
   const handleClick = (section) => {
     setActiveSection(section);
-    sectionRefs[section].current.scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-    });
+    sectionRefs[section]?.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
   return (
-    <div className="w-1/6  p-6 rounded-lg shadow-lg">
-      <h2 className="text-2xl font-semibold text-gray mb-8">My Profile</h2>
-      <div className="space-y-6 mt-4">
-      <button
-  className={`w-full flex items-center gap-3 p-3 text-left rounded transition duration-300 ease-in-out hover:bg-orange-200 ${ 
-    activeSection === 'profile' ? 'bg-orange-400 text-white' : 'bg-orange-400 text-white'
-  } mb-4`}
-  onClick={() => handleClick('profile') }
-
-  
->
-<img src={profile} alt="Profile Icon" className="w-7 h-7" />
-
-  <span className="text-xl">Profile</span>
-</button>
-
-
-        {/* Show only if logged-in user is viewing their own profile */}
-        {loggedInUserId === profileUserId && (
+    <nav className="rounded-lg p-6 shadow-lg md:w-1/5" aria-label="Profile sections">
+      <h2 className="mb-6 text-2xl font-semibold">Profile</h2>
+      <div className="flex gap-3 md:flex-col">
+        {SECTIONS.filter((section) => !section.ownOnly || showSecurity).map((section) => (
           <button
-            className={`w-full flex items-center gap-3 text-left p-3 rounded transition duration-300 ease-in-out hover:bg-orange-200 ${
-              activeSection === 'security' ? 'bg-orange-400 text-white' : 'bg-orange-400 text-white'
-            } mb-4`}
-            onClick={() => handleClick('security')}
+            key={section.id}
+            onClick={() => handleClick(section.id)}
+            className={`flex w-full items-center gap-3 rounded p-3 text-left text-white transition duration-300 ease-in-out hover:bg-orange-300 ${
+              activeSection === section.id ? "bg-orange-500" : "bg-orange-400"
+            }`}
           >
-            <img src={setting} alt="Profile Icon" className="w-7 h-7" />
-
-            <span className="text-xl">Security</span>
+            <img src={section.icon} alt="" className="h-7 w-7" />
+            <span className="text-lg">{section.label}</span>
           </button>
-        )}
-
-        <button
-          className={`w-full flex items-center gap-3 text-left p-3 rounded transition duration-300 ease-in-out hover:bg-orange-200 ${
-            activeSection === 'activity' ? 'bg-orange-400 text-white' : 'bg-orange-400 text-white'
-          }`}
-          onClick={() => handleClick('activity')}
-        >
-          <img src={activity} alt="Profile Icon" className="w-7 h-7" />
-
-          <span className="text-xl">My Activity</span>
-        </button>
+        ))}
       </div>
-    </div>
+    </nav>
   );
 };
 

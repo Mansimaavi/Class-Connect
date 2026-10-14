@@ -1,334 +1,312 @@
-import React, { useEffect, useRef, useState } from "react";
-import axios from "axios";
+import { useCallback, useEffect, useState } from "react";
+import { Link } from "react-router-dom";
+import { useAuth } from "../Components/AuthComponents/AuthContext";
 import Navbar from "../Components/Navbar";
+import api, { getErrorMessage } from "../lib/api";
+
+const SORTS = [
+  { id: "recent", label: "Newest" },
+  { id: "rating", label: "Top rated" },
+  { id: "popular", label: "Most viewed" },
+];
+
+const Stars = ({ value, onRate, size = "text-xl", label }) => (
+  <div className="flex gap-1" role="radiogroup" aria-label={label}>
+    {[1, 2, 3, 4, 5].map((star) => (
+      <button
+        key={star}
+        type="button"
+        onClick={onRate ? () => onRate(star) : undefined}
+        disabled={!onRate}
+        className={`${size} ${value >= star ? "text-yellow-500" : "text-gray-300"} disabled:cursor-default`}
+        aria-label={`${star} star${star > 1 ? "s" : ""}`}
+      >
+        ★
+      </button>
+    ))}
+  </div>
+);
 
 const ClassNotes = () => {
-  const reviewRefs = useRef({});
-  const [showReviewInput, setShowReviewInput] = useState({});
+  const { isLoggedIn, user, isAdmin } = useAuth();
   const [notes, setNotes] = useState([]);
-  const [file, setFile] = useState(null);
+  const [subjects, setSubjects] = useState([]);
+  const [filters, setFilters] = useState({ search: "", subject: "All", sort: "recent" });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const [upload, setUpload] = useState({ file: null, title: "", topic: "", subject: "" });
   const [uploading, setUploading] = useState(false);
-  const [reviewState, setReviewState] = useState({});
+  const [uploadMessage, setUploadMessage] = useState(null);
+
+  const [reviewFor, setReviewFor] = useState(null);
+  const [review, setReview] = useState({ rating: 0, text: "" });
   const [showReviews, setShowReviews] = useState({});
 
-  useEffect(() => {
-    fetchNotes();
-  }, []);
-
-  useEffect(() => {
-    const handleClickOutside = (event) => {
-      const updated = { ...showReviewInput };
-      let changed = false;
-
-      Object.entries(reviewRefs.current).forEach(([pdfId, ref]) => {
-        if (ref && !ref.contains(event.target)) {
-          updated[pdfId] = false;
-          changed = true;
-        }
+  const fetchNotes = useCallback(async () => {
+    try {
+      const { data } = await api.get("/class-notes", {
+        params: { search: filters.search || undefined, subject: filters.subject, sort: filters.sort, limit: 60 },
       });
-
-      if (changed) setShowReviewInput(updated);
-    };
-
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [showReviewInput]);
-
-  const fetchNotes = async () => {
-    try {
-      const { data } = await axios.get("http://localhost:5000/api/class-notes");
-      setNotes(data);
+      setNotes(data.notes);
+      setSubjects(data.subjects);
+      setError("");
     } catch (err) {
-      console.error("Error fetching class notes:", err);
+      setError(getErrorMessage(err, "Couldn't load notes."));
+    } finally {
+      setLoading(false);
     }
-  };
+  }, [filters]);
 
-  const getToken = () => {
-    const user = JSON.parse(localStorage.getItem("user") || "{}");
-    return user.token || localStorage.getItem("token") || "";
-  };
+  useEffect(() => {
+    const timer = setTimeout(fetchNotes, 250); // debounce typing in the search box
+    return () => clearTimeout(timer);
+  }, [fetchNotes]);
 
-  const handleUpload = async () => {
-    if (!file) return alert("Please select a file to upload.");
+  const handleUpload = async (event) => {
+    event.preventDefault();
+    if (!upload.file || !upload.topic.trim()) return;
+    const form = new FormData();
+    form.append("file", upload.file);
+    form.append("topic", upload.topic.trim());
+    form.append("subject", upload.subject.trim() || "General");
+    if (upload.title.trim()) form.append("title", upload.title.trim());
 
-    const user = JSON.parse(localStorage.getItem("user") || "{}");
-    if (!user._id) return alert("User not logged in.");
-
-    const folderId = "65e75f9e2b1a4c3f947ea1b7";
-    const formData = new FormData();
-    formData.append("pdf", file);
-    formData.append("folderId", folderId);
-    formData.append("uploadedBy", user._id);
-    formData.append("topic", "Math Notes");
-
+    setUploading(true);
+    setUploadMessage(null);
     try {
-      setUploading(true);
-      await axios.post(
-        `http://localhost:5000/api/class-notes/upload`,
-        formData,
-        {
-          headers: {
-            "Content-Type": "multipart/form-data",
-            Authorization: `Bearer ${getToken()}`,
-          },
-        }
-      );
-      alert("File uploaded ✅");
-      setFile(null);
-      document.getElementById("fileInput").value = "";
+      await api.post("/class-notes", form);
+      setUpload({ file: null, title: "", topic: "", subject: "" });
+      event.target.reset();
+      setUploadMessage({ type: "success", text: "Note uploaded ✅" });
       fetchNotes();
     } catch (err) {
-      console.error("Upload error:", err);
-      alert("Upload failed");
+      setUploadMessage({ type: "error", text: getErrorMessage(err) });
     } finally {
       setUploading(false);
     }
   };
 
-  const handleRating = async (pdfId, rating) => {
-    const token = getToken();
-    if (!token) return alert("Please log in to rate.");
+  const openNote = (note) => {
+    window.open(note.url, "_blank", "noopener,noreferrer");
+    api
+      .post(`/class-notes/${note._id}/view`)
+      .then(({ data }) => setNotes((current) => current.map((n) => (n._id === note._id ? { ...n, viewCount: data.viewCount } : n))))
+      .catch(() => {});
+  };
 
+  const rate = async (note, rating) => {
     try {
-      setReviewState((prev) => ({
-        ...prev,
-        [pdfId]: { ...prev[pdfId], rating },
-      }));
-
-      await axios.post(
-        "http://localhost:5000/api/class-notes/rate",
-        { pdfId, rating },
-        { headers: { Authorization: `Bearer ${token}` } }
+      const { data } = await api.post(`/class-notes/${note._id}/rating`, { rating });
+      setNotes((current) =>
+        current.map((n) => (n._id === note._id ? { ...n, averageRating: data.averageRating, ratingCount: data.ratingCount, myRating: rating } : n))
       );
-      fetchNotes();
     } catch (err) {
-      console.error("Rating failed:", err);
-      alert("Failed to submit rating.");
+      window.alert(getErrorMessage(err));
     }
   };
 
-  const handleSubmitReview = async (pdfId) => {
-    const token = getToken();
-    const { rating, review } = reviewState[pdfId] || {};
-    if (!rating || !review?.trim()) {
-      return alert("Please rate and write a review.");
-    }
-
-    const note = notes.find((n) => n._id === pdfId);
-    const folderId = note?.folderId;
-
+  const submitReview = async () => {
     try {
-      await axios.post(
-        "http://localhost:5000/api/class-notes/reviews/submit-review",
-        { pdfId, rating, review, folderId },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      alert("Review submitted ✅");
-      setReviewState((prev) => {
-        const updated = { ...prev };
-        delete updated[pdfId];
-        return updated;
-      });
-      setShowReviewInput((prev) => ({ ...prev, [pdfId]: false }));
+      await api.post(`/class-notes/${reviewFor}/reviews`, { text: review.text.trim(), rating: review.rating || undefined });
+      setReviewFor(null);
+      setReview({ rating: 0, text: "" });
       fetchNotes();
     } catch (err) {
-      console.error("Review submit error:", err);
-      alert("Review submission failed.");
+      window.alert(getErrorMessage(err));
     }
   };
 
-  const isAnyReviewOpen = Object.values(showReviewInput).some(Boolean);
+  const deleteNote = async (note) => {
+    if (!window.confirm(`Delete "${note.title}"?`)) return;
+    try {
+      await api.delete(`/class-notes/${note._id}`);
+      setNotes((current) => current.filter((n) => n._id !== note._id));
+    } catch (err) {
+      window.alert(getErrorMessage(err));
+    }
+  };
+
+  const inputClass = "rounded-md border border-gray-300 p-2 text-gray-700";
 
   return (
     <>
-    <Navbar className="fixed top-0 left-0 w-full z-50"/>
-    <div className="min-h-screen bg-[#fef6f3] p-6 relative">
-      <h2 className="text-4xl font-bold text-[#222] text-center mb-10">
-        🎓 <span className="text-[#f26d4f]">Class Notes</span> Hub
-      </h2>
+      <Navbar />
+      <div className="relative min-h-screen bg-[#fef6f3] p-6">
+        <h2 className="mb-2 text-center text-4xl font-bold text-[#222]">
+          🎓 <span className="text-[#f26d4f]">Class Notes</span> Hub
+        </h2>
+        <p className="mb-8 text-center text-gray-600">Share handwritten notes and find the best ones from students everywhere.</p>
 
-      {/* Upload Section */}
-      <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-10">
-        <input
-          id="fileInput"
-          type="file"
-          onChange={(e) => setFile(e.target.files[0])}
-          className="block w-full max-w-sm border border-gray-300 rounded-md p-2 text-gray-700"
-        />
-        <button
-          onClick={handleUpload}
-          disabled={uploading}
-          className={`px-6 py-2 text-white font-bold rounded-md transition duration-300 shadow-md ${
-            uploading ? "bg-gray-400" : "bg-[#f26d4f] hover:bg-[#e25539]"
-          }`}
-        >
-          {uploading ? "Uploading..." : "Upload Note"}
-        </button>
-      </div>
-
-      {/* Overlay Blur */}
-      <div className={`transition duration-300 ${isAnyReviewOpen ? "blur-sm" : ""}`}>
-        {notes.length === 0 ? (
-          <p className="text-gray-500 text-center">No notes available yet.</p>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-8">
-            {notes.map((note) => (
-              <article
-                key={note._id}
-                className="bg-white border border-gray-300 rounded-2xl shadow-md p-4 flex flex-col justify-between h-[380px] hover:scale-105 transition"
-              >
-                <div>
-                  <span className="text-sm px-2 py-1 bg-[#8b5cf6] text-white rounded-full mb-2 inline-block">
-                    PDF Note
-                  </span>
-                  <h3 className="text-xl font-semibold">{note.name}</h3>
-                  <p className="text-gray-600 text-sm">👤 {note.uploadedBy?.name || "Unknown"}</p>
-                  <p className="text-gray-500 text-sm">
-                    🕒 {new Date(note.createdAt).toLocaleString()}
-                  </p>
-                  <a
-                    href={`http://localhost:5000${note.path}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[#f26d4f] hover:underline mt-2 inline-block font-medium"
-                  >
-                    📄 View PDF
-                  </a>
-                </div>
-
-                <div className="mt-4">
-                  <p className="text-sm text-gray-700 mb-1">
-                    ⭐ Avg Rating: {note.averageRating || "N/A"}
-                  </p>
-                  <p className="text-sm text-gray-600 mb-1">👥 Rated by {note.ratingCount || 0} users</p>
-                  <div className="flex gap-1">
-                    {[1, 2, 3, 4, 5].map((star) => (
-                      <button
-                        key={star}
-                        onClick={() => handleRating(note._id, star)}
-                        className={`text-xl ${
-                          (reviewState[note._id]?.rating || 0) >= star
-                            ? "text-yellow-500"
-                            : "text-gray-300"
-                        }`}
-                        aria-label={`Rate ${star} star${star > 1 ? "s" : ""}`}
-                      >
-                        ★
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="mt-3 border-t pt-2 flex items-center justify-between">
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setShowReviewInput((prev) => ({
-                        ...prev,
-                        [note._id]: true,
-                      }));
-                    }}
-                    className="text-sm font-semibold text-blue-600 underline flex items-center gap-1"
-                  >
-                    ✍️ Write a Review
-                  </button>
-
-                  {note.reviews?.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setShowReviews((prev) => ({
-                          ...prev,
-                          [note._id]: !prev[note._id],
-                        }));
-                      }}
-                      className="text-sm font-medium text-green-700 flex items-center gap-1 hover:underline"
-                      aria-label={showReviews[note._id] ? "Hide Reviews" : "Show Reviews"}
-                      title={showReviews[note._id] ? "Hide Reviews" : "Show Reviews"}
-                    >
-                      Reviews {showReviews[note._id] ? "▲" : "▼"}
-                    </button>
-                  )}
-                </div>
-
-                {showReviews[note._id] && (
-                  <ul className="pl-4 list-disc text-sm text-gray-700 space-y-2 mt-2 max-h-36 overflow-y-auto">
-                    {note.reviews.map((r, idx) => (
-                      <li key={idx}>
-                        <strong className="text-[#f26d4f]">{r.user?.name || "Anonymous"}:</strong>{" "}
-                        {r.review}
-                        <span className="block text-xs text-gray-500">
-                          ({new Date(r.createdAt).toLocaleString()})
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Review Modal */}
-      {Object.entries(showReviewInput).map(([pdfId, isOpen]) => {
-        if (!isOpen) return null;
-        return (
-          <div
-            key={pdfId}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40 backdrop-blur-sm"
-          >
-            <div
-              ref={(el) => (reviewRefs.current[pdfId] = el)}
-              className="bg-white p-6 rounded-xl shadow-2xl w-[90%] max-w-md z-50"
+        {isLoggedIn ? (
+          <form onSubmit={handleUpload} className="mx-auto mb-8 flex max-w-4xl flex-wrap items-center justify-center gap-3 rounded-xl bg-white p-4 shadow">
+            <input
+              type="file"
+              accept=".pdf,.png,.jpg,.jpeg,.webp,.ppt,.pptx,.doc,.docx"
+              onChange={(e) => setUpload({ ...upload, file: e.target.files[0] || null })}
+              className={`${inputClass} max-w-xs`}
+              aria-label="Note file"
+            />
+            <input className={inputClass} placeholder="Topic (e.g. BFS & DFS)" value={upload.topic} maxLength={100} onChange={(e) => setUpload({ ...upload, topic: e.target.value })} />
+            <input
+              className={inputClass}
+              placeholder="Subject (e.g. DSA)"
+              list="note-subjects"
+              value={upload.subject}
+              maxLength={100}
+              onChange={(e) => setUpload({ ...upload, subject: e.target.value })}
+            />
+            <datalist id="note-subjects">
+              {subjects.map((subject) => (
+                <option key={subject} value={subject} />
+              ))}
+            </datalist>
+            <input className={inputClass} placeholder="Title (optional)" value={upload.title} maxLength={255} onChange={(e) => setUpload({ ...upload, title: e.target.value })} />
+            <button
+              type="submit"
+              disabled={uploading || !upload.file || !upload.topic.trim()}
+              className="rounded-md bg-[#f26d4f] px-6 py-2 font-bold text-white shadow-md transition hover:bg-[#e25539] disabled:bg-gray-400"
             >
-              <h3 className="text-lg font-bold mb-3 text-center text-[#f26d4f]">Write a Review</h3>
-              <div className="flex justify-center gap-1 mb-2">
-                {[1, 2, 3, 4, 5].map((s) => (
-                  <button
-                    key={s}
-                    type="button"
-                    onClick={() =>
-                      setReviewState((prev) => ({
-                        ...prev,
-                        [pdfId]: { ...prev[pdfId], rating: s },
-                      }))
-                    }
-                    className={`text-2xl ${
-                      (reviewState[pdfId]?.rating || 0) >= s ? "text-yellow-500" : "text-gray-300"
-                    }`}
-                    aria-label={`Rate ${s} star${s > 1 ? "s" : ""}`}
-                  >
-                    ★
-                  </button>
-                ))}
+              {uploading ? "Uploading…" : "Upload note"}
+            </button>
+            {uploadMessage && (
+              <p className={`mb-0 w-full text-center text-sm ${uploadMessage.type === "error" ? "text-red-600" : "text-green-700"}`}>{uploadMessage.text}</p>
+            )}
+          </form>
+        ) : (
+          <p className="mb-8 text-center text-gray-600">
+            <Link to="/login">Log in</Link> to share your notes and rate others.
+          </p>
+        )}
+
+        <div className="mx-auto mb-8 flex max-w-4xl flex-wrap items-center justify-center gap-3">
+          <input
+            className={`${inputClass} min-w-[240px] flex-1`}
+            placeholder="Search by title, topic or subject"
+            value={filters.search}
+            onChange={(e) => setFilters({ ...filters, search: e.target.value })}
+            aria-label="Search notes"
+          />
+          <select className={inputClass} value={filters.subject} onChange={(e) => setFilters({ ...filters, subject: e.target.value })} aria-label="Filter by subject">
+            <option value="All">All subjects</option>
+            {subjects.map((subject) => (
+              <option key={subject} value={subject}>
+                {subject}
+              </option>
+            ))}
+          </select>
+          <select className={inputClass} value={filters.sort} onChange={(e) => setFilters({ ...filters, sort: e.target.value })} aria-label="Sort notes">
+            {SORTS.map((sort) => (
+              <option key={sort.id} value={sort.id}>
+                {sort.label}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className={`transition duration-300 ${reviewFor ? "blur-sm" : ""}`}>
+          {loading ? (
+            <p className="text-center text-gray-500">Loading notes…</p>
+          ) : error ? (
+            <p className="text-center text-red-600">{error}</p>
+          ) : notes.length === 0 ? (
+            <p className="text-center text-gray-500">No notes match yet.</p>
+          ) : (
+            <div className="grid grid-cols-1 gap-8 sm:grid-cols-2 md:grid-cols-3">
+              {notes.map((note) => (
+                <article key={note._id} className="flex flex-col justify-between rounded-2xl border border-gray-300 bg-white p-4 shadow-md transition hover:scale-[1.02]">
+                  <div>
+                    <div className="mb-2 flex flex-wrap gap-2">
+                      <span className="inline-block rounded-full bg-[#8b5cf6] px-2 py-1 text-sm text-white">{note.subject}</span>
+                      <span className="inline-block rounded-full bg-gray-100 px-2 py-1 text-sm text-gray-700">{note.topic}</span>
+                    </div>
+                    <h3 className="text-xl font-semibold">{note.title}</h3>
+                    <p className="mb-0 text-sm text-gray-600">👤 {note.uploadedBy?.name || "Unknown"}</p>
+                    <p className="text-sm text-gray-500">
+                      🕒 {new Date(note.createdAt).toLocaleDateString()} · 👁 {note.viewCount} views
+                    </p>
+                    <button onClick={() => openNote(note)} className="mt-1 font-medium text-[#f26d4f] hover:underline">
+                      📄 Open note
+                    </button>
+                  </div>
+
+                  <div className="mt-4">
+                    <p className="mb-1 text-sm text-gray-700">
+                      ⭐ {note.ratingCount ? `${note.averageRating} average from ${note.ratingCount} rating${note.ratingCount === 1 ? "" : "s"}` : "No ratings yet"}
+                    </p>
+                    {isLoggedIn && <Stars value={note.myRating || 0} onRate={(star) => rate(note, star)} label={`Rate ${note.title}`} />}
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-between border-t pt-2">
+                    {isLoggedIn && (
+                      <button type="button" onClick={() => setReviewFor(note._id)} className="text-sm font-semibold text-blue-600 underline">
+                        ✍️ Write a review
+                      </button>
+                    )}
+                    {note.reviews?.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowReviews((current) => ({ ...current, [note._id]: !current[note._id] }))}
+                        className="text-sm font-medium text-green-700 hover:underline"
+                      >
+                        Reviews ({note.reviews.length}) {showReviews[note._id] ? "▲" : "▼"}
+                      </button>
+                    )}
+                    {(isAdmin || note.uploadedBy?._id === user?._id) && (
+                      <button type="button" onClick={() => deleteNote(note)} className="text-sm text-red-600 hover:underline">
+                        Delete
+                      </button>
+                    )}
+                  </div>
+
+                  {showReviews[note._id] && (
+                    <ul className="mt-2 max-h-36 list-disc space-y-2 overflow-y-auto pl-4 text-sm text-gray-700">
+                      {note.reviews.map((r) => (
+                        <li key={r._id}>
+                          <strong className="text-[#f26d4f]">{r.user?.name || "Anonymous"}:</strong> {r.text}
+                          <span className="block text-xs text-gray-500">{new Date(r.createdAt).toLocaleString()}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {reviewFor && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" role="dialog" aria-modal="true">
+            <div className="w-[90%] max-w-md rounded-xl bg-white p-6 shadow-2xl">
+              <h3 className="mb-3 text-center text-lg font-bold text-[#f26d4f]">Write a review</h3>
+              <div className="mb-2 flex justify-center">
+                <Stars value={review.rating} onRate={(rating) => setReview({ ...review, rating })} size="text-2xl" label="Your rating" />
               </div>
               <textarea
                 rows={3}
-                placeholder="Your review..."
-                className="w-full border rounded-md p-2 text-sm focus:outline-none focus:ring focus:ring-orange-300"
-                value={reviewState[pdfId]?.review || ""}
-                onChange={(e) =>
-                  setReviewState((prev) => ({
-                    ...prev,
-                    [pdfId]: { ...prev[pdfId], review: e.target.value },
-                  }))
-                }
+                placeholder="What did you like? What could be better?"
+                className="w-full rounded-md border p-2 text-sm focus:outline-none focus:ring focus:ring-orange-300"
+                value={review.text}
+                maxLength={1000}
+                onChange={(e) => setReview({ ...review, text: e.target.value })}
               />
-              <button
-                type="button"
-                onClick={() => handleSubmitReview(pdfId)}
-                className="mt-4 w-full bg-green-600 text-white text-sm px-4 py-2 rounded hover:bg-green-700"
-              >
-                Submit Review
-              </button>
+              <div className="mt-4 flex gap-2">
+                <button type="button" onClick={() => setReviewFor(null)} className="w-1/2 rounded bg-gray-100 px-4 py-2 text-sm hover:bg-gray-200">
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={submitReview}
+                  disabled={!review.text.trim()}
+                  className="w-1/2 rounded bg-green-600 px-4 py-2 text-sm text-white hover:bg-green-700 disabled:opacity-50"
+                >
+                  Submit review
+                </button>
+              </div>
             </div>
           </div>
-        );
-      })}
-    </div>
+        )}
+      </div>
     </>
   );
 };

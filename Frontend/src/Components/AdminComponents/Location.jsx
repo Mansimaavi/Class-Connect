@@ -8,6 +8,7 @@ import {
 } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import api, { getErrorMessage } from '../../lib/api';
 
 import markerIcon from 'leaflet/dist/images/marker-icon.png';
 import markerIcon2x from 'leaflet/dist/images/marker-icon-2x.png';
@@ -40,12 +41,10 @@ const Location = () => {
   useEffect(() => {
     const fetchUserLocations = async () => {
       try {
-        const response = await fetch('http://localhost:5000/api/admin/locations');
-        if (!response.ok) throw new Error('Failed to fetch locations');
-        const data = await response.json();
-        setUsers(data);
+        const { data } = await api.get('/admin/locations');
+        setUsers(data.locations);
       } catch (err) {
-        setError(err.message);
+        setError(getErrorMessage(err, 'Failed to fetch locations'));
       } finally {
         setLoading(false);
       }

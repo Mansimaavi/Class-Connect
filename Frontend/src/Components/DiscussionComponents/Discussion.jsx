@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import axios from "axios";
 import { Avatar, Button, TextField } from "@mui/material";
 import ReactTimeAgo from "react-time-ago";
 import { FaUserCircle, FaQuestionCircle, FaClock } from "react-icons/fa";
-import img from '../../assets/discussion-illustration.png'
+import img from '../../assets/discussion-illustration.webp'
 import Navbar from "../Navbar";
+import { useAuth } from "../AuthComponents/AuthContext";
+import api, { getErrorMessage } from "../../lib/api";
 
 
 function LastSeen({ date }) {
@@ -15,31 +16,51 @@ function LastSeen({ date }) {
 export default function DiscussionBox() {
   const [questions, setQuestions] = useState([]);
   const [newQuestion, setNewQuestion] = useState("");
+  const [search, setSearch] = useState("");
+  const [error, setError] = useState("");
+  const [posting, setPosting] = useState(false);
   const navigate = useNavigate();
+  const { isLoggedIn, user, isAdmin } = useAuth();
 
   useEffect(() => {
-    const fetchQuestions = async () => {
+    const timer = setTimeout(async () => {
       try {
-        const res = await axios.get("http://localhost:5000/api/questions?populate=answers");
-        setQuestions(res.data);
+        const { data } = await api.get("/questions", { params: { search: search || undefined, limit: 50 } });
+        setQuestions(data.questions);
+        setError("");
       } catch (err) {
-        console.error("Error fetching questions", err);
+        setError(getErrorMessage(err, "Couldn't load questions."));
       }
-    };
-
-    fetchQuestions();
-  }, []);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   const handlePostQuestion = async () => {
     if (!newQuestion.trim()) return;
+    if (!isLoggedIn) {
+      navigate("/login", { state: { from: "/discussion" } });
+      return;
+    }
+    setPosting(true);
     try {
-      await axios.post("http://localhost:5000/api/questions", {
-        questionName: newQuestion,
-      });
+      const { data } = await api.post("/questions", { title: newQuestion.trim() });
+      setQuestions((current) => [data.question, ...current]);
       setNewQuestion("");
-      window.location.reload();
+      setError("");
     } catch (err) {
-      console.error("Error posting question", err);
+      setError(getErrorMessage(err));
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  const handleDelete = async (question) => {
+    if (!window.confirm("Delete this question and its answers?")) return;
+    try {
+      await api.delete(`/questions/${question._id}`);
+      setQuestions((current) => current.filter((q) => q._id !== question._id));
+    } catch (err) {
+      setError(getErrorMessage(err));
     }
   };
 
@@ -88,18 +109,24 @@ export default function DiscussionBox() {
               variant="contained"
               style={{ backgroundColor: "darkgreen", color: "white" }}
               onClick={handlePostQuestion}
+              disabled={posting || newQuestion.trim().length < 5}
             >
-              Post
+              {isLoggedIn ? "Post" : "Log in to post"}
             </Button>
           </div>
+          {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
         </div>
 
         {/* Show questions */}
         <div>
-          <h2 className="text-xl font-bold text-orange-600 mb-5 flex items-center gap-2">
-            <FaQuestionCircle className="text-blue-500" />
-            All Questions
-          </h2>
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+            <h2 className="mb-0 flex items-center gap-2 text-xl font-bold text-orange-600">
+              <FaQuestionCircle className="text-blue-500" />
+              All Questions
+            </h2>
+            <TextField size="small" label="Search" value={search} onChange={(e) => setSearch(e.target.value)} sx={{ backgroundColor: "#fff" }} />
+          </div>
+          {questions.length === 0 && <p className="text-gray-500">No questions yet. Ask the first one!</p>}
           {questions.map((q, index) => (
             <div
               key={q._id}
@@ -109,18 +136,17 @@ export default function DiscussionBox() {
                 <div className="flex-1 min-w-[200px]">
                   <div className="text-base font-semibold mb-1 text-blue-900 flex items-center gap-2">
                     <FaQuestionCircle className="text-purple-500" />
-                    {String(index + 1).padStart(2, "0")}. {q.questionName}
+                    {String(index + 1).padStart(2, "0")}. {q.title}
                   </div>
                 </div>
 
                 <div className="flex items-center gap-2 min-w-[150px]">
-                  <Avatar
-                    src={q.user?.avatar || "https://i.pravatar.cc/150?u=default"}
-                    sx={{ width: 32, height: 32 }}
-                  />
+                  <Avatar sx={{ width: 32, height: 32, bgcolor: "#f97316", fontSize: 14 }}>
+                    {(q.author?.name || "?").charAt(0).toUpperCase()}
+                  </Avatar>
                   <span className="text-sm text-gray-800 flex items-center gap-1">
                     <FaUserCircle className="text-green-600" />
-                    {q.user?.name || "Anonymous"}
+                    {q.author?.name || "Former member"}
                   </span>
                 </div>
 
@@ -137,7 +163,7 @@ export default function DiscussionBox() {
                   style={{ borderColor: "purple", color: "purple" }}
                   onClick={() => handleViewAnswers(q._id)}
                 >
-                  View other answers
+                  View answers ({q.answerCount || 0})
                 </Button>
                 <Button
                   variant="outlined"
@@ -147,6 +173,11 @@ export default function DiscussionBox() {
                 >
                   Add answer
                 </Button>
+                {(isAdmin || q.author?._id === user?._id) && (
+                  <Button variant="text" size="small" color="error" onClick={() => handleDelete(q)}>
+                    Delete
+                  </Button>
+                )}
               </div>
             </div>
           ))}

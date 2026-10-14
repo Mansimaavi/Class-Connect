@@ -1,7 +1,18 @@
-import React, { useState, useEffect } from "react";
-import { Card, Row, Col, Form } from "react-bootstrap";
+import { BarElement, CategoryScale, Chart as ChartJS, Legend, LinearScale, Title, Tooltip } from "chart.js";
+import { useEffect, useState } from "react";
+import { Card, Col, Form, Row } from "react-bootstrap";
 import { Bar } from "react-chartjs-2";
-import axios from "axios";
+import api from "../../lib/api";
+
+ChartJS.register(CategoryScale, LinearScale, BarElement, Title, Tooltip, Legend);
+
+const RANGE_LABELS = {
+  last24hours: "last 24 hours",
+  last7days: "last 7 days",
+  lastMonth: "last month",
+  lastYear: "last year",
+  overall: "all time",
+};
 
 const StatisticsCards = () => {
   const [stats, setStats] = useState({
@@ -17,11 +28,8 @@ const StatisticsCards = () => {
   useEffect(() => {
     const fetchStats = async () => {
       try {
-        const { data } = await axios.get(`http://localhost:5000/api/stat/stats?timeRange=${timeRange}`);
-        // console.log("jii")
-        console.log("Fetched Data:", data)
-        // console.log(hii)
-        setStats(data);
+        const { data } = await api.get("/admin/stats", { params: { range: timeRange } });
+        setStats(data.stats);
       } catch (error) {
         console.error("Error fetching statistics:", error);
       }
@@ -32,7 +40,7 @@ const StatisticsCards = () => {
 
   // Chart Data for Active Users
   const activeUsersChartData = {
-    labels: [`Active Users (${timeRange})`],
+    labels: [`Active users (${RANGE_LABELS[timeRange]})`],
     datasets: [
       {
         label: "Active Users",
@@ -49,7 +57,7 @@ const StatisticsCards = () => {
     labels: ["Uploads", "Downloads"],
     datasets: [
       {
-        label: `Files (${timeRange})`,
+        label: `Files (${RANGE_LABELS[timeRange]})`,
         data: [stats.totalUploads, stats.totalDownloads],
         backgroundColor: ["rgba(153, 102, 255, 0.5)", "rgba(54, 162, 235, 0.5)"],
         borderColor: ["rgba(153, 102, 255, 1)", "rgba(54, 162, 235, 1)"],
@@ -62,7 +70,7 @@ const StatisticsCards = () => {
     labels: stats.mostActiveUsers?.map((user) => user.name || user.username ) || [],
     datasets: [
       {
-        label: `Most Active Users (${timeRange})`,
+        label: `Top uploaders (${RANGE_LABELS[timeRange]})`,
         data: stats.mostActiveUsers?.map((user) => user.totalUploads) || [],
         backgroundColor: "rgba(255, 159, 64, 0.5)",
         borderColor: "rgba(255, 159, 64, 1)",
@@ -90,7 +98,7 @@ const StatisticsCards = () => {
         <Col md={4}>
           <Card className="shadow-lg mb-4">
             <Card.Body>
-              <Card.Title>Active Users ({timeRange})</Card.Title>
+              <Card.Title>Active users</Card.Title>
               <h3>{stats.activeUsersCount}</h3>
               <Bar data={activeUsersChartData} options={{ responsive: true }} />
             </Card.Body>
@@ -99,7 +107,7 @@ const StatisticsCards = () => {
         <Col md={4}>
           <Card className="shadow-lg mb-4">
             <Card.Body>
-              <Card.Title>File Uploads and Downloads ({timeRange})</Card.Title>
+              <Card.Title>Uploads &amp; downloads</Card.Title>
               <Bar data={fileStatsChartData} options={{ responsive: true }} />
               <div className="mt-2">
                 <h4>Uploads: {stats.totalUploads}</h4>
@@ -111,7 +119,7 @@ const StatisticsCards = () => {
         <Col md={4}>
           <Card className="shadow-lg mb-4">
             <Card.Body>
-              <Card.Title>Most Active Users ({timeRange})</Card.Title>
+              <Card.Title>Top uploaders</Card.Title>
               <Bar data={activeUsersData} options={{ responsive: true }} />
             </Card.Body>
           </Card>
