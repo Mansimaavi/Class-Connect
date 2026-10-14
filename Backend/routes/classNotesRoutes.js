@@ -1,13 +1,42 @@
 import express from "express";
-import { ratePdf, getClassNotes, uploadClassNote, submitReview } from "../Controllers/ClassNotesController/classNoteController.js";
-import AuthMiddleware from "../middleware/authMiddleware.js";
-import uploadPdf from "../middleware/multerMiddleware.js";
+import {
+  addReview,
+  deleteNote,
+  listNotes,
+  rateNote,
+  recordView,
+  uploadNote,
+} from "../Controllers/classNotesController/classNoteController.js";
+import { PERMISSIONS as P } from "../config/permissions.js";
+import { authenticate, optionalAuth } from "../middleware/authMiddleware.js";
+import { pickUploadedFile, uploadDocument } from "../middleware/multerMiddleware.js";
+import { uploadLimiter } from "../middleware/rateLimiters.js";
+import { requirePermission } from "../middleware/rbac.js";
+import validate from "../middleware/validate.js";
+import {
+  listNotesQuery,
+  noteParams,
+  rateNoteSchema,
+  reviewNoteSchema,
+  uploadNoteSchema,
+} from "../validators/contentValidators.js";
 
 const router = express.Router();
 
-router.get("/", getClassNotes);
-router.post("/upload", AuthMiddleware, uploadPdf, uploadClassNote);
-router.post("/rate", AuthMiddleware, ratePdf);
-router.post("/reviews/submit-review", AuthMiddleware, submitReview);
+router.get("/", optionalAuth, validate({ query: listNotesQuery }), listNotes);
+router.post(
+  "/",
+  authenticate,
+  requirePermission(P.NOTE_UPLOAD),
+  uploadLimiter,
+  uploadDocument,
+  pickUploadedFile,
+  validate({ body: uploadNoteSchema }),
+  uploadNote
+);
+router.post("/:noteId/view", validate({ params: noteParams }), recordView);
+router.post("/:noteId/rating", authenticate, validate({ params: noteParams, body: rateNoteSchema }), rateNote);
+router.post("/:noteId/reviews", authenticate, validate({ params: noteParams, body: reviewNoteSchema }), addReview);
+router.delete("/:noteId", authenticate, validate({ params: noteParams }), deleteNote);
 
 export default router;

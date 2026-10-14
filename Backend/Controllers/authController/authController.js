@@ -1,249 +1,259 @@
-import bcrypt from 'bcryptjs';
-import User from '../../models/User.js'; 
-import OTP from '../../models/OTP.js'; 
-import jwt from 'jsonwebtoken';
-import otpGenerator from 'otp-generator';
-import mailSender from '../../utils/MailSender.js';  
-import { passwordUpdated } from '../../mail/templates/passwordUpdate.js';
-import { emitUserRegistered } from '../../index.js';
-import Notification from '../../models/Notification.js';
-import dotenv from 'dotenv';
-import { sendVerificationEmail } from '../../models/OTP.js';
+import bcrypt from "bcryptjs";
+import env from "../../config/env.js";
+import { permissionsForRole } from "../../config/permissions.js";
+import otpTemplate from "../../mail/templates/emailVerificationTemplate.js";
+import { passwordResetTemplate, passwordUpdatedTemplate } from "../../mail/templates/passwordTemplates.js";
+import OtpCode, { OTP_MAX_ATTEMPTS, OTP_TTL_MINUTES } from "../../models/otpCode.js";
+import User from "../../models/user.js";
+import {
+  REFRESH_COOKIE,
+  clearRefreshCookie,
+  endSession,
+  revokeAllSessions,
+  rotateSession,
+  startSession,
+} from "../../services/authService.js";
+import { notifyAdmins } from "../../services/notificationService.js";
+import { broadcastStats } from "../../services/statsService.js";
+import { TWO_FACTOR_FIELDS, verifySecondFactor } from "../../services/twoFactorService.js";
+import ApiError from "../../utils/ApiError.js";
+import { randomNumericCode, randomToken, safeEqual, sha256 } from "../../utils/crypto.js";
+import logger from "../../utils/logger.js";
+import sendMail from "../../utils/mailSender.js";
+import { signTwoFactorChallenge, verifyTwoFactorChallenge } from "../../utils/tokens.js";
 
-dotenv.config();
+const RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
+// Compared against when the account doesn't exist, so a failed login takes the
+// same time whether or not the email/username is registered.
+const DUMMY_HASH = bcrypt.hashSync("not-a-real-password", 4);
 
-export const register = async (req, res) => {
-  const { name, username, email, password, course, college, latitude, longitude, otp } = req.body;
+const otpHash = (email, code) => sha256(`${email}:${code}`);
 
-  console.log("Request body:", req.body);
+const authPayload = (user, accessToken) => ({
+  success: true,
+  accessToken,
+  user,
+  permissions: permissionsForRole(user.role),
+});
 
-  try {
-    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
-    if (existingUser) {
-      return res.status(400).json({ message: "Username or Email already exists" });
-    }
+const sendInBackground = (mail) =>
+  sendMail(mail).catch((error) => logger.error({ err: error, to: mail.to }, "failed to send email"));
 
-    // Find the most recent OTP for the email
-    const response = await OTP.find({ email }).sort({ createdAt: -1 }).limit(1);
-    console.log(response);
-    if (response.length === 0) {
-      // OTP not found for the email
-      return res.status(400).json({
-        success: false,
-        message: "The OTP is not valid",
-      });
-    } else if (otp !== response[0].otp) {
-      // Invalid OTP
-      return res.status(400).json({
-        success: false,
-        message: "The OTP is not valid",
-      });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const newUser = new User({
-      name,
-      username,
-      email,
-      password: hashedPassword,
-      course,
-      college,
-      location: { latitude, longitude },
-      otp
-    });
-
-    await newUser.save();
-
-    // Save notification with user's name
-    const notification = new Notification({
-      type: "user",
-      message: `New user registered: ${name} (${username})`,
-      name: name, // Store the user's name in the notification
-    });
-    await notification.save();
-    emitUserRegistered(newUser);
-
-    console.log("New User:", newUser);
-    await newUser.save();
-    res.status(201).json({ message: "User registered successfully" });
-  } catch (error) {
-    console.error("Registration error:", error);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-
-export const login = async (req, res) => {
-  try {
-    const user = await User.findOne({ email: req.body.email });
-    if (!user) {
-      return res.status(404).json({ message: "User not found!" });
-    }
-
-    if (!user.password) {
-      return res.status(500).json({ message: "User password is missing." });
-    }
-
-    const match = await bcrypt.compare(req.body.password, user.password);
-    if (!match) {
-      return res.status(401).json({ message: "Wrong credentials!" });
-    }
-
-    const token = jwt.sign(
-      { _id: user._id, username: user.username, email: user.email, role: user.role },
-      process.env.SECRET,
-      { expiresIn: "3d" }
-    );
-    const today = new Date().toISOString().split("T")[0]; // Get today's date
-    const activityIndex = user.activityLog.findIndex(
-      (log) => log.date.toISOString().split("T")[0] === today
-    );
-
-    if (activityIndex !== -1) {
-      user.activityLog[activityIndex].logins += 1;
-    } else {
-      user.activityLog.push({ logins: 1, totalTimeSpent: 0, date: new Date() });
-    }
-
-    user.lastLogin = new Date(); // Store login time
-    user.sessionStart = new Date(); // Track session start time
-
-    await user.save();
-    const { password, ...userData } = user._doc;
-
-    res.status(200).json({
-      message: "Login successful",
-      token,  // Send token directly
-      user: userData,
-    });
-  } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-
-export const logout = async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    if (!user) {
-      return res.status(400).json({ message: "User not found!" });
-    }
-
-    if (!user.sessionStart) {
-      return res.status(400).json({ message: "User session not found!" });
-    }
-
-    console.log("User sessionStart:", user.sessionStart);
-
-    const sessionEnd = new Date(); // Logout time
-    const sessionStart = user.sessionStart; // Stored at login
-
-    let sessionDuration = (sessionEnd - sessionStart) / 1000; // Seconds
-
-    if (!sessionStart) {
-      return res.status(400).json({ message: "Session start time not found!" });
-    }
-
-    const sessionStartDate = sessionStart.toISOString().split("T")[0];
-    const sessionEndDate = sessionEnd.toISOString().split("T")[0];
-
-    // Handle session spanning multiple days
-    if (sessionStartDate !== sessionEndDate) {
-      const midnight = new Date(sessionStart);
-      midnight.setHours(23, 59, 59, 999);
-
-      let timeOnLoginDay = (midnight - sessionStart) / 1000;
-      let timeOnNextDay = sessionDuration - timeOnLoginDay;
-
-      updateActivityLog(user, sessionStartDate, timeOnLoginDay);
-      updateActivityLog(user, sessionEndDate, timeOnNextDay);
-    } else {
-      updateActivityLog(user, sessionStartDate, sessionDuration);
-    }
-
-    user.sessionStart = null;
-    await user.save();
-    res.status(200).json({ message: "User logged out successfully!" });
-
-  } catch (error) {
-    console.error("Logout error:", error);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-
-// Function to update activity log with time spent
-function updateActivityLog(user, date, duration) {
-  const activityIndex = user.activityLog.findIndex(
-    (log) => log.date.toISOString().split("T")[0] === date
-  );
-
-  if (activityIndex !== -1) {
-    user.activityLog[activityIndex].totalTimeSpent += duration;
-  } else {
-    user.activityLog.push({ logins: 1, totalTimeSpent: duration, date: new Date(date) });
-  }
-}
-
-// Change Password function
-export const changePassword = async (req, res) => {
-  const { userId } = req.params; // Assuming you're passing userId in the URL
-  const { oldPassword, newPassword } = req.body;
-
-  try {
-    // Find the user by ID
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found!" });
-    }
-
-    // Check if old password matches
-    const isMatch = await bcrypt.compare(oldPassword, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ message: "Incorrect old password!" });
-    }
-
-    // Hash the new password
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    // Update the user's password
-    user.password = hashedPassword;
-    await user.save();
-
-    res.status(200).json({ message: "Password updated successfully!" });
-  } catch (error) {
-    console.error("Password change error:", error);
-    res.status(500).json({ message: "Internal server error" });
-  }
-};
-export const sendotp = async (req, res) => {
+/** POST /api/auth/send-otp — emails a 6-digit code to verify a new account's address. */
+export const sendOtp = async (req, res) => {
   const { email } = req.body;
-
-  try {
-    // Check if the email is already registered
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: "Email is already registered" });
-    }
-
-    // Generate a 6-digit OTP
-    const otp = otpGenerator.generate(6, { upperCase: false, specialChars: false });
-
-    // Save the OTP to the database with the email
-    const newOtp = new OTP({
-      email,
-      otp,
-    });
-
-    await newOtp.save();
-
-    // Send the OTP to the user's email
-    await sendVerificationEmail(email, otp);
-
-    // Respond with success message
-    res.status(200).json({ message: "OTP sent successfully to your email!" });
-  } catch (error) {
-    console.error("OTP sending error:", error);
-    res.status(500).json({ message: "Internal server error" });
+  if (await User.exists({ email })) {
+    throw ApiError.conflict("An account with this email already exists", "EMAIL_TAKEN");
   }
+
+  const code = randomNumericCode(6);
+  await OtpCode.deleteMany({ email, purpose: "register" });
+  await OtpCode.create({ email, purpose: "register", codeHash: otpHash(email, code) });
+
+  await sendMail({
+    to: email,
+    subject: `${code} is your ClassConnect verification code`,
+    html: otpTemplate(code, OTP_TTL_MINUTES),
+    text: `Your ClassConnect verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes.`,
+    devPreview: `verification code: ${code}`,
+  });
+
+  res.json({ success: true, message: "We've sent a verification code to your email" });
 };
 
+/** POST /api/auth/register */
+export const register = async (req, res) => {
+  const { otp, latitude, longitude, ...profile } = req.body;
+  const { email, username } = profile;
+
+  const record = await OtpCode.findOne({ email, purpose: "register" }).sort({ createdAt: -1 });
+  if (!record || record.expiresAt < new Date()) {
+    throw ApiError.badRequest("Your verification code has expired. Please request a new one.", undefined, "OTP_EXPIRED");
+  }
+  if (record.attempts >= OTP_MAX_ATTEMPTS) {
+    await record.deleteOne();
+    throw ApiError.badRequest("Too many incorrect attempts. Please request a new code.", undefined, "OTP_TOO_MANY_ATTEMPTS");
+  }
+  if (!safeEqual(record.codeHash, otpHash(email, otp))) {
+    record.attempts += 1;
+    await record.save();
+    throw ApiError.badRequest("That verification code is incorrect", undefined, "OTP_INVALID");
+  }
+
+  const existing = await User.findOne({ $or: [{ email }, { username }] }).select("email username");
+  if (existing) {
+    const field = existing.email === email ? "email" : "username";
+    throw new ApiError(409, `That ${field} is already registered`, "DUPLICATE_KEY", [{ field, message: "Already in use" }]);
+  }
+
+  const user = await User.create({
+    ...profile,
+    location: { latitude: latitude ?? null, longitude: longitude ?? null },
+  });
+  await OtpCode.deleteMany({ email });
+
+  await notifyAdmins({
+    type: "user_registered",
+    title: "New user",
+    message: `${user.name} (@${user.username}) just joined ClassConnect`,
+    actor: user._id,
+  });
+  broadcastStats();
+
+  res.status(201).json({ success: true, message: "Account created. You can sign in now.", user });
+};
+
+/** POST /api/auth/login — email or username + password. */
+export const login = async (req, res) => {
+  const { identifier, password } = req.body;
+  const query = identifier.includes("@") ? { email: identifier } : { username: identifier };
+  const user = await User.findOne(query).select("+password +sessions +tokenVersion");
+
+  const passwordOk = user ? await user.comparePassword(password) : await bcrypt.compare(password, DUMMY_HASH);
+  if (!user || !passwordOk) {
+    throw ApiError.unauthorized("Incorrect email/username or password", "INVALID_CREDENTIALS");
+  }
+  if (user.isBlocked) {
+    throw ApiError.forbidden("Your account has been blocked. Please contact an administrator.", "ACCOUNT_BLOCKED");
+  }
+
+  if (user.twoFactor?.enabled) {
+    return res.json({
+      success: true,
+      requiresTwoFactor: true,
+      twoFactorToken: signTwoFactorChallenge(user),
+      message: "Enter the code from your authenticator app",
+    });
+  }
+
+  user.recordLogin();
+  const accessToken = await startSession(user, req, res);
+  return res.json(authPayload(user, accessToken));
+};
+
+/** POST /api/auth/login/2fa — second step of sign-in for accounts with 2FA. */
+export const loginWithTwoFactor = async (req, res) => {
+  const { twoFactorToken, code } = req.body;
+
+  let challenge;
+  try {
+    challenge = verifyTwoFactorChallenge(twoFactorToken);
+  } catch {
+    throw ApiError.unauthorized("This sign-in attempt has expired. Please sign in again.", "TWO_FACTOR_CHALLENGE_EXPIRED");
+  }
+
+  const user = await User.findById(challenge.sub).select(`+sessions +tokenVersion ${TWO_FACTOR_FIELDS}`);
+  if (!user || !user.twoFactor?.enabled) {
+    throw ApiError.unauthorized("This sign-in attempt is no longer valid. Please sign in again.", "TWO_FACTOR_CHALLENGE_EXPIRED");
+  }
+  if (user.isBlocked) {
+    throw ApiError.forbidden("Your account has been blocked. Please contact an administrator.", "ACCOUNT_BLOCKED");
+  }
+
+  const method = verifySecondFactor(user, code);
+  user.recordLogin();
+  const accessToken = await startSession(user, req, res);
+
+  return res.json({
+    ...authPayload(user, accessToken),
+    ...(method === "recovery" && { recoveryCodesRemaining: user.twoFactor.recoveryCodes.length }),
+  });
+};
+
+/** POST /api/auth/refresh — rotates the refresh cookie and returns a new access token. */
+export const refresh = async (req, res) => {
+  const { user, accessToken } = await rotateSession(req.cookies?.[REFRESH_COOKIE], req, res);
+  res.json(authPayload(user, accessToken));
+};
+
+/** POST /api/auth/logout — ends this device's session. */
+export const logout = async (req, res) => {
+  await endSession(req.cookies?.[REFRESH_COOKIE], res);
+  res.json({ success: true, message: "Signed out" });
+};
+
+/** POST /api/auth/logout-all — ends every session and invalidates all access tokens. */
+export const logoutAll = async (req, res) => {
+  await revokeAllSessions(req.user._id);
+  clearRefreshCookie(res);
+  res.json({ success: true, message: "Signed out of all devices" });
+};
+
+/** GET /api/auth/me */
+export const me = async (req, res) => {
+  res.json({ success: true, user: req.user, permissions: permissionsForRole(req.user.role) });
+};
+
+/** GET /api/auth/sessions — devices this account is signed in on. */
+export const listSessions = async (req, res) => {
+  const user = await User.findById(req.user._id).select("+sessions");
+  const now = Date.now();
+  const sessions = user.sessions
+    .filter((session) => session.expiresAt.getTime() > now)
+    .map((session) => ({
+      id: session.jti,
+      userAgent: session.userAgent,
+      ip: session.ip,
+      createdAt: session.createdAt,
+      lastUsedAt: session.lastUsedAt,
+      expiresAt: session.expiresAt,
+    }))
+    .reverse();
+  res.json({ success: true, sessions });
+};
+
+/** DELETE /api/auth/sessions/:sessionId — signs out one device. */
+export const revokeSession = async (req, res) => {
+  const result = await User.updateOne(
+    { _id: req.user._id },
+    { $pull: { sessions: { jti: req.params.sessionId } } }
+  );
+  if (!result.modifiedCount) throw ApiError.notFound("Session");
+  res.json({ success: true, message: "Device signed out" });
+};
+
+/** POST /api/auth/forgot-password — always answers the same way to avoid revealing accounts. */
+export const forgotPassword = async (req, res) => {
+  const user = await User.findOne({ email: req.body.email });
+  if (user && !user.isBlocked) {
+    const token = randomToken(32);
+    user.passwordReset = { tokenHash: sha256(token), expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS) };
+    await user.save();
+    const resetUrl = `${env.appUrl}/reset-password/${token}`;
+    sendInBackground({
+      to: user.email,
+      subject: "Reset your ClassConnect password",
+      html: passwordResetTemplate(user.name, resetUrl),
+      text: `Reset your password: ${resetUrl}`,
+      devPreview: resetUrl,
+    });
+  }
+  res.json({ success: true, message: "If an account exists for that email, we've sent a reset link." });
+};
+
+/** POST /api/auth/reset-password */
+export const resetPassword = async (req, res) => {
+  const { token, password } = req.body;
+  const user = await User.findOne({
+    "passwordReset.tokenHash": sha256(token),
+    "passwordReset.expiresAt": { $gt: new Date() },
+  }).select("+passwordReset.tokenHash +passwordReset.expiresAt +sessions +tokenVersion");
+
+  if (!user) {
+    throw ApiError.badRequest("This reset link is invalid or has expired", undefined, "INVALID_RESET_TOKEN");
+  }
+
+  user.password = password;
+  user.passwordReset = undefined;
+  user.sessions = [];
+  user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+  await user.save();
+
+  sendInBackground({
+    to: user.email,
+    subject: "Your ClassConnect password was changed",
+    html: passwordUpdatedTemplate(user.name, user.email),
+  });
+
+  res.json({ success: true, message: "Password updated. Please sign in with your new password." });
+};

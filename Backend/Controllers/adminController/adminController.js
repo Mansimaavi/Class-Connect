@@ -1,260 +1,196 @@
-import User from "../../models/User.js";
-import Folder from "../../models/Folder.js";
-import mongoose from 'mongoose';
-import { emitUpdatedStats } from "../../utils/Stat.js";
+import { ROLES, ROLE_RANK } from "../../config/permissions.js";
+import Classroom from "../../models/classroom.js";
+import Notification from "../../models/notification.js";
+import Progress from "../../models/progress.js";
+import User from "../../models/user.js";
+import { revokeAllSessions } from "../../services/authService.js";
+import { deleteClassroomCascade } from "../../services/classroomService.js";
+import {
+  broadcastStats,
+  getOverviewStats,
+  getRangeStats,
+  uploadAndDownloadCounts,
+} from "../../services/statsService.js";
+import { getIO, rooms } from "../../socket/emitter.js";
+import ApiError from "../../utils/ApiError.js";
+import { paginationMeta } from "../../validators/common.js";
 
-export const getAllUsers = async (req, res) => {
-  try {
-
-    const { filterType, role } = req.query;
-    let filter = {};
-    let sortOptions = {};
-
-    // ✅ Filter by role
-    if (filterType === "role" && role) {
-      filter.role = role; // Filter users by role
-    }
-
-    // ✅ Sorting Logic
-    if (filterType === "lastLogin") {
-      sortOptions.lastLogin = -1;  // Most recent logins first
-    } else if (filterType === "uploads") {
-      sortOptions.uploadsCount = -1;  // Most uploads first
-    } else if (filterType === "downloads") {
-      sortOptions.downloadsCount = -1;  // Most downloads first
-    } else {
-      sortOptions = { lastLogin: -1, createdAt: -1 }; // Default: Most recent login first
-    }
-
-    // ✅ Fetch users with filters and sorting
-    
-      const users = await User.find(filter, "-password").sort(sortOptions);
-      res.status(200).json(users);
-  } catch (error) {
-    console.error("Error fetching users:", error);
-    res.status(500).json({ message: "Server error", error });
-  }
+const SORTS = {
+  lastLogin: { lastLogin: -1, createdAt: -1 },
+  createdAt: { createdAt: -1 },
+  name: { name: 1 },
 };
 
+/** Loads the target user and makes sure the caller outranks them. */
+const loadTargetUser = async (req) => {
+  const target = await User.findById(req.params.userId);
+  if (!target) throw ApiError.notFound("User");
+  if (target._id.equals(req.user._id)) {
+    throw ApiError.badRequest("You can't do that to your own account", undefined, "CANNOT_TARGET_SELF");
+  }
+  if (ROLE_RANK[target.role] >= ROLE_RANK[req.user.role]) {
+    throw ApiError.forbidden("You can't manage a user with the same or a higher role", "INSUFFICIENT_ROLE");
+  }
+  return target;
+};
 
-// Delete a user by ID (Admin Only)
+const disconnectUser = (userId) => {
+  getIO()?.in(rooms.user(userId.toString())).disconnectSockets(true);
+};
+
+/** GET /api/admin/users?search=&role=&status=&sort=&page=&limit= */
+export const listUsers = async (req, res) => {
+  const { search, role, status, sort, page, limit } = req.query;
+  const filter = {};
+  if (role) filter.role = role;
+  if (status) filter.isBlocked = status === "blocked";
+  if (search) {
+    const pattern = new RegExp(search, "i");
+    filter.$or = [{ name: pattern }, { username: pattern }, { email: pattern }];
+  }
+
+  const [users, total] = await Promise.all([
+    User.find(filter)
+      .select("-activityLog -location")
+      .sort(SORTS[sort])
+      .skip((page - 1) * limit)
+      .limit(limit),
+    User.countDocuments(filter),
+  ]);
+
+  const counts = await uploadAndDownloadCounts(users.map((user) => user._id));
+  res.json({
+    success: true,
+    users: users.map((user) => ({
+      ...user.toJSON(),
+      uploadsCount: counts.uploads.get(user._id.toString()) ?? 0,
+      downloadsCount: counts.downloads.get(user._id.toString()) ?? 0,
+    })),
+    pagination: paginationMeta({ page, limit }, total),
+  });
+};
+
+/** PATCH /api/admin/users/:userId/role — superadmin only (promote to admin / demote). */
+export const updateUserRole = async (req, res) => {
+  const target = await loadTargetUser(req);
+  const { role } = req.body;
+  if (target.role === role) {
+    return res.json({ success: true, message: `User is already ${role === ROLES.ADMIN ? "an admin" : "a user"}`, user: target });
+  }
+
+  target.role = role;
+  await target.save();
+  // Old access tokens carry the old role; make the user pick up the new one.
+  await revokeAllSessions(target._id);
+  disconnectUser(target._id);
+  broadcastStats();
+
+  return res.json({
+    success: true,
+    message: role === ROLES.ADMIN ? "User promoted to admin" : "Admin demoted to user",
+    user: target,
+  });
+};
+
+/** PATCH /api/admin/users/:userId/status — block or unblock. */
+export const updateUserStatus = async (req, res) => {
+  const target = await loadTargetUser(req);
+  const { blocked } = req.body;
+
+  target.isBlocked = blocked;
+  await target.save();
+  if (blocked) {
+    await revokeAllSessions(target._id);
+    disconnectUser(target._id);
+  }
+  broadcastStats();
+
+  res.json({ success: true, message: blocked ? "User blocked" : "User unblocked", user: target });
+};
+
+/** DELETE /api/admin/users/:userId — removes the account and the classrooms it owns. */
 export const deleteUser = async (req, res) => {
-  try {
-    const userId = req.params.userId;
-    const user = await User.findById(userId);
-    
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+  const target = await loadTargetUser(req);
 
-    // Delete folders created by the user
-    await Folder.deleteMany({ creator: userId });
-
-    // Remove user from any folders they have joined
-    await Folder.updateMany(
-      { members: userId },
-      { $pull: { members: userId } }
-    );
-
-    // Delete the user
-    await User.deleteOne({ _id: userId });
-    await emitUpdatedStats(req.app.get("io"));
-
-    res.status(200).json({ message: "User and their folders deleted successfully" });
-  } catch (error) {
-    console.error("Error deleting user:", error);
-    res.status(500).json({ message: "Server error", error });
+  const owned = await Classroom.find({ owner: target._id }).select("_id").lean();
+  for (const classroom of owned) {
+    await deleteClassroomCascade(classroom._id);
   }
+  await Promise.all([
+    Classroom.updateMany({ "members.user": target._id }, { $pull: { members: { user: target._id } } }),
+    Progress.deleteMany({ user: target._id }),
+    Notification.deleteMany({ user: target._id }),
+  ]);
+  await target.deleteOne();
+  disconnectUser(target._id);
+  broadcastStats();
+
+  res.json({ success: true, message: "User deleted", deletedClassrooms: owned.length });
 };
 
-// 🚀 Promote User to Admin (Only Super Admin Can Do This)
-export const promoteToAdmin = async (req, res) => {
-  try {
-    const { userId } = req.body;
-
-    // Check if the logged-in user is a superadmin
-    if (req.user.role !== "superadmin") {
-      return res.status(403).json({ message: "Access denied. Only superadmin can promote users." });
-    }
-
-    const user = await User.findById(userId);
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    if (user.role === "admin") {
-      return res.status(400).json({ message: "User is already an admin" });
-    }
-
-    // Check if the user is a superadmin
-    if (user.role === "superadmin") {
-      return res.status(400).json({ message: "Cannot promote superadmin to admin" });
-    }
-
-    user.role = "admin";
-    await user.save();
-    await emitUpdatedStats(req.app.get("io"));
-
-    res.status(200).json({ message: "User promoted to admin successfully" });
-  } catch (error) {
-    console.error("Error promoting user to admin:", error);
-    res.status(500).json({ message: "Internal server error" });
-  }
+/** GET /api/admin/stats/overview */
+export const overviewStats = async (_req, res) => {
+  res.json({ success: true, stats: await getOverviewStats() });
 };
 
-//  Demote Admin to Regular User (Only Super Admin Can Do This)
-export const demoteAdmin = async (req, res) => {
-  try {
-    const { userId } = req.body;
-
-    // Check if the logged-in user is a superadmin
-    if (req.user.role !== "superadmin") {
-      return res.status(403).json({ message: "Access denied. Only superadmin can demote users." });
-    }
-
-    const user = await User.findById(userId);
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    if (user.role !== "admin") {
-      return res.status(400).json({ message: "User is not an admin" });
-    }
-
-    // Check if the user is a superadmin
-    if (user.role === "superadmin") {
-      return res.status(400).json({ message: "Cannot demote superadmin" });
-    }
-
-    user.role = "user";
-    await user.save();
-    await emitUpdatedStats(req.app.get("io"));
-
-    res.status(200).json({ message: "Admin demoted to regular user successfully" });
-  } catch (error) {
-    console.error("Error demoting admin:", error);
-    res.status(500).json({ message: "Internal server error" });
-  }
+/** GET /api/admin/stats?range=last7days */
+export const rangeStats = async (req, res) => {
+  res.json({ success: true, stats: await getRangeStats(req.query.range) });
 };
 
+/**
+ * GET /api/admin/activity?scope=today|overall&tzOffset=330
+ * Logins and time spent per user, either for "today" in the admin's timezone or all time.
+ */
+export const userActivity = async (req, res) => {
+  const { scope, tzOffset } = req.query;
+  const pipeline = [{ $unwind: "$activityLog" }];
 
-// Admin blocks a user
-export const blockUser = async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    user.isBlocked = true;
-    await user.save();
-    await emitUpdatedStats(req.app.get("io"));
-
-    res.status(200).json({ message: "User has been blocked." });
-  } catch (error) {
-    console.error("Error blocking user:", error);
-    res.status(500).json({ message: "Server error" });
+  if (scope === "today") {
+    const offsetMs = tzOffset * 60 * 1000;
+    const localNow = new Date(Date.now() + offsetMs);
+    localNow.setUTCHours(0, 0, 0, 0);
+    const start = new Date(localNow.getTime() - offsetMs);
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    pipeline.push({ $match: { "activityLog.date": { $gte: start, $lt: end } } });
   }
+
+  pipeline.push(
+    {
+      $group: {
+        _id: "$_id",
+        name: { $first: "$name" },
+        username: { $first: "$username" },
+        totalLogins: { $sum: "$activityLog.logins" },
+        totalTimeSpent: { $sum: "$activityLog.totalTimeSpent" },
+      },
+    },
+    { $sort: { totalTimeSpent: -1, totalLogins: -1 } },
+    { $limit: 50 }
+  );
+
+  res.json({ success: true, activity: await User.aggregate(pipeline) });
 };
 
-// Admin unblocks a user
-export const unblockUser = async (req, res) => {
-  try {
-    // console.log("user",req.user._id )
-    const user = await User.findById(req.user._id);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    user.isBlocked = false;
-    user.warnings = 0; // Reset warnings
-    await user.save();
-    await emitUpdatedStats(req.app.get("io"));
-
-    res.status(200).json({ message: "User has been unblocked." });
-  } catch (error) {
-    console.error("Error unblocking user:", error);
-    res.status(500).json({ message: "Server error" });
-  }
-};
-
-
-export const getUserLocation = async (req, res) => {
-  try {
-    // Fetch all users and select only name, latitude, and longitude
-    const users = await User.find({}).select('name location'); 
-
-    // If no users found
-    if (users.length === 0) {
-      return res.status(404).json({ message: 'No users found' });
-    }
-
-    // Map over the users and return their name and location (latitude, longitude)
-    const userLocations = users.map((user) => ({
+/** GET /api/admin/locations — where users signed up from (only those who shared it). */
+export const userLocations = async (_req, res) => {
+  const users = await User.find({ "location.latitude": { $ne: null }, "location.longitude": { $ne: null } })
+    .select("name username location")
+    .lean();
+  res.json({
+    success: true,
+    locations: users.map((user) => ({
+      _id: user._id,
       name: user.name,
+      username: user.username,
       latitude: user.location.latitude,
       longitude: user.location.longitude,
-    }));
-
-    // Return all users' locations
-    return res.json(userLocations);
-  } catch (error) {
-    // Log and return the error if something goes wrong
-    console.error('Error fetching users location:', error);
-    return res.status(500).json({ message: 'Error fetching users locations' });
-  }
+    })),
+  });
 };
-export const getUserUploadsAndDownloads = async (req, res) => {
-  const { userId } = req.params;
 
-  try {
-    // Validate if userId is a valid ObjectId
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ error: "Invalid user ID" });
-    }
-
-    // Aggregate to get the total uploads by the user
-    const totalUploads = await Folder.aggregate([
-      { $unwind: { path: "$pdfs", preserveNullAndEmptyArrays: true } },
-      {
-        $match: {
-          "pdfs.uploadedBy": new mongoose.Types.ObjectId(userId),
-        },
-      },
-      { $count: "totalUploads" },
-    ]);
-
-    // Aggregate to get the total downloads by the user
-    const totalDownloads = await Folder.aggregate([
-      { $unwind: { path: "$pdfs", preserveNullAndEmptyArrays: true } },
-      { $unwind: "$pdfs.downloadedBy" },
-      {
-        $match: {
-          "pdfs.downloadedBy.user": new mongoose.Types.ObjectId(userId),
-        },
-      },
-      { $count: "totalDownloads" },
-    ]);
-
-    // Aggregate to get the total folders created by the user
-    const totalCreatedFolders = await Folder.aggregate([
-      { $match: { "createdBy": new mongoose.Types.ObjectId(userId) } },
-      { $count: "totalCreatedFolders" },
-    ]);
-
-    // Aggregate to get the total folders joined by the user
-    const totalJoinedFolders = await Folder.aggregate([
-      { $match: { "joinedUsers": new mongoose.Types.ObjectId(userId) } },
-      { $count: "totalJoinedFolders" },
-    ]);
-
-    // Send the response
-    return res.status(200).json({
-      totalUploads: totalUploads[0] ? totalUploads[0].totalUploads : 0,
-      totalDownloads: totalDownloads[0] ? totalDownloads[0].totalDownloads : 0,
-      totalCreatedFolders: totalCreatedFolders[0] ? totalCreatedFolders[0].totalCreatedFolders : 0,
-      totalJoinedFolders: totalJoinedFolders[0] ? totalJoinedFolders[0].totalJoinedFolders : 0,
-    });
-  } catch (error) {
-    console.error("Error fetching uploads, downloads, and folder counts:", error);
-    res.status(500).json({ error: "Error fetching data" });
-  }
+/** GET /api/admin/notifications — the live activity feed. */
+export const activityFeed = async (_req, res) => {
+  const feed = await Notification.find({ audience: "admin" }).sort({ createdAt: -1 }).limit(50).lean();
+  res.json({ success: true, notifications: feed.reverse() });
 };

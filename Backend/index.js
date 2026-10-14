@@ -1,128 +1,57 @@
-import express from "express";
-import cors from "cors";
-import http from "http";
-import { Server } from "socket.io";
-import connectDB from "./utils/Database.js";
-import authRouter from "./routes/authRoutes.js";
-import folderRouter from "./routes/folderRoutes.js";
-import pdfRoute from "./routes/pdfRoutes.js";
-import questionRouter from "./routes/questionRoutes.js";
-import answerRouter from "./routes/answerRoutes.js";
-import chatRoom from "./routes/chatRoutes.js";
-import ChatRoom from "./models/ChatModels/ChatRoom.js";
-import whiteboardRoutes from './routes/whiteboardRoutes.js';
-import notificationsRoutes from "./routes/notification.js";
-import stats from './routes/statRoute.js';
-import adminRoutes from "./routes/adminRoutes.js";
-import classNotesRouter from "./routes/classNotesRoutes.js";
-import summarizeRoutes from "./routes/summarizeRoute.js";
-import profile from "./routes/userRoute.js";
-// import { initWhiteboardSocket } from "./Controllers/whiteboardController.js";
-import progressRouter from "./routes/progressRoutes.js";
+import http from "node:http";
+import createApp from "./app.js";
+import { connectDB, disconnectDB } from "./config/database.js";
+import env from "./config/env.js";
+import initSocket from "./socket/index.js";
+import { flushAllWhiteboards } from "./socket/handlers/whiteboardHandlers.js";
+import logger from "./utils/logger.js";
 
+const SHUTDOWN_TIMEOUT_MS = 10_000;
 
-const app = express();
-const server = http.createServer(app);
+const start = async () => {
+  await connectDB();
 
-// ✅ Initialize Socket.io
-const io = new Server(server, {
-  cors: {
-    origin: "http://localhost:5173",
-    methods: ["GET", "POST"],
-    credentials: true,
-  },
-});
-app.set("io", io);
+  const app = createApp();
+  const server = http.createServer(app);
+  const io = initSocket(server);
 
-// Initialize all socket events
-// initWhiteboardSocket(io);
-
-app.use((req, res, next) => {
-  req.io = io;
-  next();
-});
-
-connectDB();
-app.use(express.json());
-app.use(cors({
-  origin: "http://localhost:5173",
-  credentials: true,
-}));
-
-app.get("/", (req, res) => {
-  res.send("Backend is working");
-});
-
-// ✅ Socket.io Events
-io.on("connection", (socket) => {
-  socket.on("join_room", ({ roomId, userId }) => {
-    socket.join(roomId);
-    console.log(`User ${userId} joined room ${roomId}`);
+  server.listen(env.port, () => {
+    logger.info({ port: env.port, env: env.nodeEnv }, "ClassConnect API listening");
   });
-  socket.on("send_message", ({ chatRoom, sender, text }) => {
-    if (!chatRoom) return;
-    io.to(chatRoom).emit("receive_message", { sender, text });
-  });
-  socket.on("add_member", async ({ chatRoom, userId, newMember }) => {
+
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ signal }, "shutting down");
+
+    const force = setTimeout(() => {
+      logger.error("graceful shutdown timed out, forcing exit");
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    force.unref();
+
     try {
-      const room = await ChatRoom.findById(chatRoom);
-      if (!room) {
-        socket.emit("member_added", { success: false, message: "Chat room not found." });
-        return;
-      }
-
-      if (room.members.includes(newMember)) {
-        socket.emit("member_added", { success: false, message: "Member already in room." });
-        return;
-      }
-
-      room.members.push(newMember);
-      await room.save();
-
-      socket.emit("member_added", { success: true, message: "Member added successfully!" });
-      io.to(chatRoom).emit("member_added", { success: true });
+      await new Promise((resolve) => io.close(() => resolve()));
+      await new Promise((resolve) => server.close(() => resolve()));
+      await flushAllWhiteboards();
+      await disconnectDB();
+      process.exit(0);
     } catch (error) {
-      socket.emit("member_added", { success: false, message: "Error adding member." });
+      logger.error({ err: error }, "error during shutdown");
+      process.exit(1);
     }
-  });
+  };
 
-  socket.on("disconnect", () => {
-    // console.log("User disconnected:", socket.id);
-  });
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+};
+
+process.on("unhandledRejection", (reason) => {
+  logger.error({ err: reason }, "unhandled promise rejection");
 });
 
-
-// ✅ API Routes
-app.use("/api/auth", authRouter);
-app.use("/api/folders", folderRouter);
-app.use("/api/pdfProgress", progressRouter); 
-app.use("/api/pdfs", pdfRoute);
-app.use("/api/chat", chatRoom);
-app.use("/api/answers", answerRouter);
-app.use("/api/questions", questionRouter);
-app.use('/api/whiteboard', whiteboardRoutes);
-app.use("/api/notifications", notificationsRoutes);
-app.use("/api/admin", adminRoutes);
-app.use("/api/stat", stats);
-app.use("/api/profile", profile);
-app.use("/api/class-notes", classNotesRouter);
-app.use("/api", summarizeRoutes);
-
-
-// ✅ Start Server
-export const emitUserRegistered = (userName) => {
-  io.emit('user-registered', { message: `New user registered: ${userName}` });
-};
-
-export const emitFileUploaded = (fileName) => {
-  io.emit('file-uploaded', { message: `A new file (${fileName}) has been uploaded.` });
-};
-
-export const emitFileDownloaded = (fileName) => {
-  io.emit('file-downloaded', { message: `⬇️ ${fileName} has been downloaded.` });
-};
-const port = process.env.PORT || 5000;
-server.listen(port, () => {
-  console.log(` Server is running on port ${port}`);
+start().catch((error) => {
+  logger.fatal({ err: error }, "failed to start server");
+  process.exit(1);
 });
-export { io };

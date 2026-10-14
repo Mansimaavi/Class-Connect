@@ -1,53 +1,53 @@
-import Question from "../../models/Question.js";
+import { PERMISSIONS, roleHasPermission } from "../../config/permissions.js";
+import Answer from "../../models/answer.js";
+import Question from "../../models/question.js";
+import ApiError from "../../utils/ApiError.js";
+import { paginationMeta } from "../../validators/common.js";
 
-// ✅ Create a question (Only authenticated users)
+const AUTHOR_FIELDS = "name username avatarUrl";
+
+/** GET /api/questions?search=&page=&limit= (public) */
+export const listQuestions = async (req, res) => {
+  const { search, page, limit } = req.query;
+  const filter = {};
+  if (search) {
+    const pattern = new RegExp(search, "i");
+    filter.$or = [{ title: pattern }, { details: pattern }];
+  }
+
+  const [questions, total] = await Promise.all([
+    Question.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate("author", AUTHOR_FIELDS),
+    Question.countDocuments(filter),
+  ]);
+
+  res.json({ success: true, questions, pagination: paginationMeta({ page, limit }, total) });
+};
+
+/** GET /api/questions/:questionId (public) */
+export const getQuestion = async (req, res) => {
+  const question = await Question.findById(req.params.questionId).populate("author", AUTHOR_FIELDS);
+  if (!question) throw ApiError.notFound("Question");
+  res.json({ success: true, question });
+};
+
+/** POST /api/questions */
 export const createQuestion = async (req, res) => {
-  try {
-    const { questionName, questionUrl } = req.body;
-    const user = req.user; // From AuthMiddleware
-
-    if (!questionName) {
-      return res.status(400).json({ message: "Question name is required" });
-    }
-
-    const newQuestion = new Question({
-      questionName,
-      questionUrl,
-      user: user._id,
-    });
-
-    await newQuestion.save();
-    res.status(201).json(newQuestion);
-  } catch (error) {
-    res.status(500).json({ message: "Error adding question" });
-  }
+  const question = await Question.create({ ...req.body, author: req.user._id });
+  await question.populate("author", AUTHOR_FIELDS);
+  res.status(201).json({ success: true, message: "Question posted", question });
 };
 
-// ✅ Fetch all questions with answers
-export const getAllQuestions = async (req, res) => {
-  try {
-    const questions = await Question.find().populate("user", "userName photo")
-      .populate({ path: "answers", populate: { path: "user", select: "userName photo" } });
-
-    res.status(200).json(questions);
-  } catch (error) {
-    res.status(500).json({ message: "Error fetching questions" });
-  }
-};
-
-// ✅ Delete question (Only by owner)
+/** DELETE /api/questions/:questionId — author or moderator. */
 export const deleteQuestion = async (req, res) => {
-  try {
-    const question = await Question.findById(req.params.id);
-    if (!question) return res.status(404).json({ message: "Question not found" });
-
-    if (question.user.toString() !== req.user._id) {
-      return res.status(403).json({ message: "Unauthorized" });
-    }
-
-    await question.deleteOne();
-    res.status(200).json({ message: "Question deleted" });
-  } catch (error) {
-    res.status(500).json({ message: "Error deleting question" });
+  const question = await Question.findById(req.params.questionId);
+  if (!question) throw ApiError.notFound("Question");
+  if (!question.author.equals(req.user._id) && !roleHasPermission(req.user.role, PERMISSIONS.CONTENT_MODERATE)) {
+    throw ApiError.forbidden("You can only delete your own questions");
   }
+  await Promise.all([question.deleteOne(), Answer.deleteMany({ question: question._id })]);
+  res.json({ success: true, message: "Question deleted" });
 };

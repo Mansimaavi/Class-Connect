@@ -1,175 +1,130 @@
-import mongoose from "mongoose";
-import Pdf from "../../models/Pdf.js";
-import User from "../../models/User.js";
-import { Readable } from 'stream';
-import cloudinary from '../../utils/Cloudinary.js';
+import { PERMISSIONS, roleHasPermission } from "../../config/permissions.js";
+import ClassNote from "../../models/classNote.js";
+import { broadcastStats } from "../../services/statsService.js";
+import { deleteFile, uploadFile } from "../../services/storageService.js";
+import ApiError from "../../utils/ApiError.js";
+import { paginationMeta } from "../../validators/common.js";
 
-
-export const getClassNotes = async (req, res) => {
-  try {
-   const notes = await Pdf.find({})
-  .populate({ path: "uploadedBy", select: "name email" })
-  .populate({ path: "reviews.user", select: "name email", strictPopulate: false }) // 🔧 FIXED
-  .exec();
-    const enhancedNotes = notes.map((note) => {
-      const ratingCount = note.ratings?.length || 0;
-      const avgRating = ratingCount
-        ? note.ratings.reduce((acc, r) => acc + r.rating, 0) / ratingCount
-        : null;
-
-      return {
-        ...note.toObject(),
-        averageRating: avgRating?.toFixed(1),
-        ratingCount,
-        reviews: note.reviews?.map((r) => ({
-          user: r.user,
-          review: r.review,
-          createdAt: r.createdAt,
-        })),
-      };
-    });
-
-    res.status(200).json(enhancedNotes);
-  } catch (error) {
-    console.error("❌ Error in getClassNotes:", error.message);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
+const SORTS = {
+  recent: { createdAt: -1 },
+  rating: { averageRating: -1, ratingCount: -1, createdAt: -1 },
+  popular: { viewCount: -1, createdAt: -1 },
 };
 
-const bufferToStream = (buffer) => {
-  const readable = new Readable();
-  readable.push(buffer);
-  readable.push(null);
-  return readable;
+const serialize = (note, userId) => {
+  const json = note.toJSON ? note.toJSON() : note;
+  const myRating = userId ? json.ratings?.find((rating) => rating.user?.toString() === userId.toString())?.value ?? null : null;
+  const { ratings: _ratings, ...rest } = json;
+  return { ...rest, myRating };
 };
 
-export const uploadClassNote = async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ message: "No file uploaded" });
-    }
-    const { topic, uploadedBy } = req.body;
-    if (!topic || !uploadedBy) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-    if (!mongoose.Types.ObjectId.isValid(uploadedBy)) {
-      return res.status(400).json({ message: "Invalid user ID format" });
-    }
-    const objectIdUserId = new mongoose.Types.ObjectId(uploadedBy);
-    const user = await User.findById(objectIdUserId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-    const result = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        {
-          resource_type: 'auto',
-          folder: `class_notes`,
-          timeout: 60000,
-          type: "upload",
-        },
-        (error, result) => {
-          if (error) {
-            reject(error);
-          }
-          else {
-            resolve(result);
-          }
-        }
-      );
-      bufferToStream(req.file.buffer).pipe(stream);
-    });
-    const newNote = new Pdf({
-      name: req.file.originalname,
-      path: result.secure_url,
-      publicId: result.public_id,
-      uploadedBy: objectIdUserId,
-      topic,
-      ratings: [],
-    });
-    await newNote.save();
-
-    res.status(201).json({
-      message: "Class note uploaded successfully",
-      note: newNote,
-      uploadedBy: {
-        _id: user._id,
-        name: user.name,
-        email: user.email,
-      },
-    });
-  } catch (error) {
-    console.error("Error uploading class note:", error);
-    res.status(500).json({ 
-      message: "Server error",
-      error: error.message 
-    });
-  }
+const findNote = async (noteId) => {
+  const note = await ClassNote.findById(noteId);
+  if (!note) throw ApiError.notFound("Note");
+  return note;
 };
 
-export const ratePdf = async (req, res) => {
-  try {
-    const { pdfId, rating } = req.body;
-    const userId = req.user._id; 
-    if (!pdfId || !rating) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-    if (rating < 1 || rating > 5) {
-      return res.status(400).json({ message: "Rating must be between 1 and 5" });
-    }
-    const objectIdPdfId = new mongoose.Types.ObjectId(pdfId);
-    const objectIdUserId = new mongoose.Types.ObjectId(userId);
-    const pdf = await Pdf.findById(objectIdPdfId);
-    if (!pdf) {
-      return res.status(404).json({ message: "PDF not found" });
-    }
-    const existingRating = pdf.ratings.find((r) => r.userId.toString() === userId.toString());
-    if (existingRating) {
-      existingRating.rating = rating;
-    } else {
-      pdf.ratings.push({ userId: objectIdUserId, rating });
-    }
-    pdf.averageRating =
-      pdf.ratings.reduce((acc, curr) => acc + curr.rating, 0) / pdf.ratings.length;
-
-    await pdf.save();
-
-    res.status(200).json({ message: "Rating added successfully", averageRating: pdf.averageRating });
-  } catch (error) {
-    console.error("❌ Error rating PDF:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
+/** GET /api/class-notes?search=&subject=&sort=recent|rating|popular&page=&limit= (public) */
+export const listNotes = async (req, res) => {
+  const { search, subject, sort, page, limit } = req.query;
+  const filter = {};
+  if (subject && subject !== "All") filter.subject = subject;
+  if (search) {
+    const pattern = new RegExp(search, "i");
+    filter.$or = [{ title: pattern }, { topic: pattern }, { subject: pattern }];
   }
+
+  const [notes, total, subjects] = await Promise.all([
+    ClassNote.find(filter)
+      .sort(SORTS[sort])
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate([
+        { path: "uploadedBy", select: "name username" },
+        { path: "reviews.user", select: "name username" },
+      ]),
+    ClassNote.countDocuments(filter),
+    ClassNote.distinct("subject"),
+  ]);
+
+  res.json({
+    success: true,
+    notes: notes.map((note) => serialize(note, req.user?._id)),
+    subjects: subjects.filter(Boolean).sort(),
+    pagination: paginationMeta({ page, limit }, total),
+  });
 };
-export const submitReview = async (req, res) => {
-  try {
-    const { pdfId, rating, review } = req.body;
-    const userId = req.user._id;
-    if (!pdfId || !rating || !review) {
-      return res.status(400).json({ message: "Missing required fields" });
-    }
-    const note = await Pdf.findById(pdfId);
-    if (!note) return res.status(404).json({ message: "PDF not found" });
-    if (!Array.isArray(note.reviews)) note.reviews = [];
-    if (!Array.isArray(note.ratings)) note.ratings = [];
-    const existingRating = note.ratings.find(r => r.userId.toString() === userId.toString());
-    if (existingRating) {
-      existingRating.rating = rating;
-    } else {
-      note.ratings.push({ userId, rating });
-    }
-    note.reviews.push({
-      user: userId,
-      review,
-      createdAt: new Date(),
-    });
-    note.averageRating =
-      note.ratings.reduce((acc, r) => acc + r.rating, 0) / note.ratings.length;
 
-    await note.save();
-    res.status(200).json({ message: "Review submitted successfully" });
-  } 
-  catch (error) {
-    console.error("❌ Error submitting review:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
+/** POST /api/class-notes (multipart: file, topic, subject, title?) */
+export const uploadNote = async (req, res) => {
+  if (!req.file) throw ApiError.badRequest("Choose a file to upload", undefined, "NO_FILE");
+
+  const stored = await uploadFile(req.file, "class-notes");
+  const note = await ClassNote.create({
+    title: req.body.title || req.file.originalname,
+    topic: req.body.topic,
+    subject: req.body.subject || "General",
+    url: stored.url,
+    publicId: stored.publicId,
+    resourceType: stored.resourceType,
+    mimeType: req.file.mimetype,
+    size: stored.size,
+    uploadedBy: req.user._id,
+  });
+  await note.populate("uploadedBy", "name username");
+  broadcastStats();
+
+  res.status(201).json({ success: true, message: "Note uploaded", note: serialize(note, req.user._id) });
+};
+
+/** POST /api/class-notes/:noteId/view — counts an open (public). */
+export const recordView = async (req, res) => {
+  const note = await ClassNote.findByIdAndUpdate(req.params.noteId, { $inc: { viewCount: 1 } }, { new: true }).select(
+    "url viewCount"
+  );
+  if (!note) throw ApiError.notFound("Note");
+  res.json({ success: true, url: note.url, viewCount: note.viewCount });
+};
+
+/** POST /api/class-notes/:noteId/rating */
+export const rateNote = async (req, res) => {
+  const note = await findNote(req.params.noteId);
+  note.setRating(req.user._id, req.body.rating);
+  await note.save();
+  res.json({
+    success: true,
+    averageRating: note.averageRating,
+    ratingCount: note.ratingCount,
+    myRating: req.body.rating,
+  });
+};
+
+/** POST /api/class-notes/:noteId/reviews */
+export const addReview = async (req, res) => {
+  const note = await findNote(req.params.noteId);
+  const { text, rating } = req.body;
+  if (rating) note.setRating(req.user._id, rating);
+  note.reviews.push({ user: req.user._id, text, rating });
+  await note.save();
+  await note.populate("reviews.user", "name username");
+
+  res.status(201).json({
+    success: true,
+    review: note.reviews[note.reviews.length - 1],
+    averageRating: note.averageRating,
+    ratingCount: note.ratingCount,
+  });
+};
+
+/** DELETE /api/class-notes/:noteId — uploader or a moderator. */
+export const deleteNote = async (req, res) => {
+  const note = await findNote(req.params.noteId);
+  const isOwner = note.uploadedBy.equals(req.user._id);
+  if (!isOwner && !roleHasPermission(req.user.role, PERMISSIONS.CONTENT_MODERATE)) {
+    throw ApiError.forbidden("Only the uploader or an admin can delete this note");
   }
+  await note.deleteOne();
+  await deleteFile(note.publicId, note.resourceType);
+  broadcastStats();
+  res.json({ success: true, message: "Note deleted" });
 };
